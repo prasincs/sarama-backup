@@ -17,12 +17,12 @@ Simplest usage, a perpetual consumer of a single topic:
       consumer,err := consumer.New("my group", client).Consume("my topic")
       for {
         select {
-	  case msg := <-consumer.Output():
-	    // process the *sarama.Message 'msg'
-	    consumer.Done(msg)
-	  case err := <-consumer.Errors():
-	    // log, whatever
-	}
+          case msg := <-consumer.Output():
+            // process the *sarama.Message 'msg'
+            consumer.Done(msg)
+          case err := <-consumer.Errors():
+            // log, whatever
+        }
       }
     }
 
