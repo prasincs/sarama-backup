@@ -13,8 +13,10 @@ Simplest usage, a perpetual consumer of a single topic:
     import "github.com/Shopify/sarama"
 
     func main() {
-      client, err := sarama.NewClient(...)
-      consumer,err := consumer.New("my group", client).Consume("my topic")
+      cfg := sarama.NewConfig()
+      cfg.Version = consumer.MinVersion // needed until sarama defaults to >= 0.9
+      client, err := sarama.NewClient(..., cfg)
+      consumer,err := consumer.NewClient("my group", nil, client).Consume("my topic")
       for {
         select {
           case msg := <-consumer.Output():
