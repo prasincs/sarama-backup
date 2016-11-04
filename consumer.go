@@ -1,5 +1,5 @@
 /*
-  simple kafka consumer group client
+  A simple kafka consumer-group client
 
   Copyright 2016 MistSys
 */
@@ -210,20 +210,50 @@ func (cl *client) triggerRejoin() {
 
 // long lived goroutine which manages this client
 func (cl *client) run(early_rc chan<- error) {
+	var member_id string // our group member id, assigned to us by kafka when we first make contact
+	refresh_coor := false
+	pause := false
+join_loop:
 	for {
+		if pause {
+			// pause before continuing, so we don't fail continuously too fast
+			pause = false
+			select {
+			case <-time.After(time.Second): // TODO should we increase timeouts?
+			case <-cl.closed:
+				return
+			}
+		}
+		if refresh_coor {
+			refresh_coor = false
+			err := cl.client.RefreshCoordinator(cl.group_name)
+			if err != nil {
+				// TODO where to deliver err?
+				pause = true
+				continue join_loop
+			}
+		}
+
 		// make contact with the kafka broker coordinating this group
+		// NOTE: sarama keeps the result cached, so we aren't taking a round trip to the kafka brokers very time
+		// (then again we need to manage sarama's cache too)
 		coor, err := cl.client.Coordinator(cl.group_name)
 		if err != nil {
 			if early_rc != nil {
 				early_rc <- cl.makeError("contacting coordinating broker", err)
 				return
-			} else {
-				// TODO where to deliver err?
 			}
+			// TODO where to deliver err?
+
+			pause = true
+			continue join_loop
 		}
 
-		var heartbeat_timer <-chan time.Time // nil, or the heartbeat timeout
-		var member_id string                 // our group member id, assigned to us by kafka when we first make contact
+		// drain any pending rejoin requests, since we're about to gather up the current state and send a JoinGoupRequest
+		select {
+		case <-cl.rejoin:
+		default:
+		}
 
 		// join the group
 		jreq := &sarama.JoinGroupRequest{
@@ -246,6 +276,9 @@ func (cl *client) run(early_rc chan<- error) {
 		})
 
 		jresp, err := coor.JoinGroup(jreq)
+		if err != nil || jresp.Err == sarama.ErrNotCoordinatorForConsumer {
+			refresh_coor = true // some I/O error happened, or the broker told us it is no longer the coordinator. in either case we should recompute the coordinator
+		}
 		if err == nil && jresp.Err != 0 {
 			err = jresp.Err
 		}
@@ -255,10 +288,12 @@ func (cl *client) run(early_rc chan<- error) {
 			if early_rc != nil {
 				early_rc <- err
 				return
-			} else {
-				// TODO where to deliver err?
-				// maybe send it to sarama.Logger?
 			}
+			// TODO where to deliver err?
+			// maybe send it to sarama.Logger?
+
+			pause = true
+			continue join_loop
 		}
 
 		// we managed to get a successfull join-group response. that is far enough that basic communication is functioning
@@ -268,10 +303,17 @@ func (cl *client) run(early_rc chan<- error) {
 			early_rc = nil
 		}
 
+		// save our member_id for next time we join
+		member_id = jresp.MemberId
+
 		// TODO map partitions if leader
 
 		// TODO send SyncGroup
 
+		// start the heartbeat timer
+		heartbeat_timer := time.After(cl.config.Heartbeat.Interval)
+
+		// and loop, sending heartbeats until something happens and we need to rejoin or exit
 	heartbeat_loop:
 		for {
 			select {
@@ -279,7 +321,7 @@ func (cl *client) run(early_rc chan<- error) {
 				// cl.Close() has been called; time to exit
 				resp, err := coor.LeaveGroup(&sarama.LeaveGroupRequest{
 					GroupId:  cl.group_name,
-					MemberId: member_id,
+					MemberId: jresp.MemberId,
 				})
 				if err == nil && resp.Err != 0 {
 					err = resp.Err
@@ -293,18 +335,24 @@ func (cl *client) run(early_rc chan<- error) {
 				return
 
 			case <-cl.rejoin:
-				// force a rejoin
-				break heartbeat_loop
+				// force a rejoin immediately
+				continue join_loop
 
 			case <-heartbeat_timer:
 				// send a heartbeat
-				hresp, err := coor.Heartbeat(&sarama.HeartbeatRequest{
+				resp, err := coor.Heartbeat(&sarama.HeartbeatRequest{
 					GroupId:      cl.group_name,
-					MemberId:     member_id,
+					MemberId:     jresp.MemberId,
 					GenerationId: jresp.GenerationId,
 				})
-				if err != nil || hresp.Err != 0 {
+				if err != nil || resp.Err == sarama.ErrNotCoordinatorForConsumer {
+					refresh_coor = true
+				}
+				if err != nil || resp.Err != 0 {
 					// we've got heartbeat troubles of one kind or another; disconnect and reconnect
+					if resp.Err == sarama.ErrNotCoordinatorForConsumer {
+						cl.client.RefreshCoordinator(cl.group_name)
+					}
 					break heartbeat_loop
 				}
 
