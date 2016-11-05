@@ -211,10 +211,184 @@ func (cl *client) triggerRejoin() {
 // long lived goroutine which manages this client
 func (cl *client) run(early_rc chan<- error) {
 	var member_id string // our group member id, assigned to us by kafka when we first make contact
-	refresh_coor := false
 	pause := false
-join_loop:
+
 	for {
+
+		// loop rejoining the group each time the group reforms
+	join_loop:
+		for {
+			if pause {
+				// pause before continuing, so we don't fail continuously too fast
+				pause = false
+				select {
+				case <-time.After(time.Second): // TODO should we increase timeouts?
+				case <-cl.closed:
+					return
+				}
+			}
+			// make contact with the kafka broker coordinating this group
+			// NOTE: sarama keeps the result cached, so we aren't taking a round trip to the kafka brokers very time
+			// (then again we need to manage sarama's cache too)
+			coor, err := cl.client.Coordinator(cl.group_name)
+			if err != nil {
+				if early_rc != nil {
+					early_rc <- cl.makeError("contacting coordinating broker", err)
+					return
+				}
+				// TODO where to deliver err?
+
+				pause = true
+				break join_loop
+			}
+
+			// drain any pending rejoin requests, since we're about to gather up the current state and send a JoinGoupRequest
+			select {
+			case <-cl.rejoin:
+			default:
+			}
+
+			// join the group
+			jreq := &sarama.JoinGroupRequest{
+				GroupId:        cl.group_name,
+				SessionTimeout: int32(cl.config.Session.Timeout / time.Millisecond),
+				MemberId:       member_id,
+				ProtocolType:   "consumer", // we implement the standard kafka 0.9 consumer protocol metadata
+			}
+
+			cl.lock.Lock()
+			var topics = make([]string, 0, len(cl.consumers))
+			for topic := range cl.consumers {
+				topics = append(topics, topic)
+			}
+			cl.lock.Unlock()
+
+			jreq.AddGroupProtocolMetadata("roundrobin", &sarama.ConsumerGroupMemberMetadata{
+				Version: 1,
+				Topics:  topics,
+			})
+
+			jresp, err := coor.JoinGroup(jreq)
+			if err != nil || jresp.Err == sarama.ErrNotCoordinatorForConsumer {
+				// some I/O error happened, or the broker told us it is no longer the coordinator. in either case we should recompute the coordinator
+				break join_loop
+			}
+			if err == nil && jresp.Err != 0 {
+				err = jresp.Err
+			}
+			if err != nil {
+				err = cl.makeError("joining group", err)
+				// if it is still early (the 1st iteration of this loop) then return the error and bail out
+				if early_rc != nil {
+					early_rc <- err
+					return
+				}
+				// TODO where to deliver err?
+				// maybe send it to sarama.Logger?
+
+				pause = true
+				continue join_loop
+			}
+
+			// we managed to get a successfull join-group response. that is far enough that basic communication is functioning
+			// and we can declare that our early_rc is success and release the caller to NewClient
+			if early_rc != nil {
+				early_rc <- nil
+				early_rc = nil
+			}
+
+			// save our member_id for next time we join
+			member_id = jresp.MemberId
+
+			// TODO map partitions if leader
+
+			// send SyncGroup
+			sreq := &sarama.SyncGroupRequest{
+				GroupId:      cl.group_name,
+				GenerationId: jresp.GenerationId,
+				MemberId:     jresp.MemberId,
+			}
+			sresp, err := coor.SyncGroup(sreq)
+			if err != nil && sresp.Err == sarama.ErrNotCoordinatorForConsumer {
+				//  we need a new coordinator
+				break join_loop
+			}
+			if err == nil && sresp.Err != 0 {
+				err = sresp.Err
+			}
+			if err != nil {
+				err = cl.makeError("synchronizing group", err)
+				// TODO where to deliver err?
+				pause = true
+				continue join_loop
+			}
+			ma, err := sresp.GetMemberAssignment()
+			if err != nil {
+				err = cl.makeError("decoding member assignments", err)
+				// TODO where to deliver err?
+				pause = true
+				continue join_loop
+			}
+			if ma.Version != 1 {
+				err = cl.makeError("decoding member assigments", fmt.Errorf("unsupported member assignment data version %d", ma.Version))
+				// TODO where to deliver err?
+				pause = true
+				continue join_loop
+			}
+
+			// TODO save and distribute the new assignments to consumers
+
+			// start the heartbeat timer
+			heartbeat_timer := time.After(cl.config.Heartbeat.Interval)
+
+			// and loop, sending heartbeats until something happens and we need to rejoin or exit
+		heartbeat_loop:
+			for {
+				select {
+				case <-cl.closed:
+					// cl.Close() has been called; time to exit
+					resp, err := coor.LeaveGroup(&sarama.LeaveGroupRequest{
+						GroupId:  cl.group_name,
+						MemberId: jresp.MemberId,
+					})
+					if err == nil && resp.Err != 0 {
+						err = resp.Err
+					}
+					if err != nil {
+						err = cl.makeError("leaving group", err)
+					}
+					// TODO where to deliver err?
+
+					// and we're done
+					return
+
+				case <-cl.rejoin:
+					// force a rejoin immediately
+					continue join_loop
+
+				case <-heartbeat_timer:
+					// send a heartbeat
+					resp, err := coor.Heartbeat(&sarama.HeartbeatRequest{
+						GroupId:      cl.group_name,
+						MemberId:     jresp.MemberId,
+						GenerationId: jresp.GenerationId,
+					})
+					if err != nil || resp.Err == sarama.ErrNotCoordinatorForConsumer {
+						// we need a new coordinator
+						break join_loop
+					}
+					if err != nil || resp.Err != 0 {
+						// we've got heartbeat troubles of one kind or another; disconnect and reconnect
+						break heartbeat_loop
+					}
+
+					// and start the next heartbeat only after we get the response to this one
+					// that way when the network or the broker are slow we back off.
+					heartbeat_timer = time.After(cl.config.Heartbeat.Interval)
+				}
+			}
+		}
+
 		if pause {
 			// pause before continuing, so we don't fail continuously too fast
 			pause = false
@@ -224,142 +398,16 @@ join_loop:
 				return
 			}
 		}
-		if refresh_coor {
-			refresh_coor = false
-			err := cl.client.RefreshCoordinator(cl.group_name)
-			if err != nil {
-				// TODO where to deliver err?
-				pause = true
-				continue join_loop
-			}
-		}
 
-		// make contact with the kafka broker coordinating this group
-		// NOTE: sarama keeps the result cached, so we aren't taking a round trip to the kafka brokers very time
-		// (then again we need to manage sarama's cache too)
-		coor, err := cl.client.Coordinator(cl.group_name)
+		// refresh the group coordinator (because saram caches the result, and the cache must be manually invalidated by us when we decide it might be needed)
+		err := cl.client.RefreshCoordinator(cl.group_name)
 		if err != nil {
 			if early_rc != nil {
-				early_rc <- cl.makeError("contacting coordinating broker", err)
+				early_rc <- cl.makeError("refreshing coordinating broker", err)
 				return
 			}
 			// TODO where to deliver err?
-
 			pause = true
-			continue join_loop
-		}
-
-		// drain any pending rejoin requests, since we're about to gather up the current state and send a JoinGoupRequest
-		select {
-		case <-cl.rejoin:
-		default:
-		}
-
-		// join the group
-		jreq := &sarama.JoinGroupRequest{
-			GroupId:        cl.group_name,
-			SessionTimeout: int32(cl.config.Session.Timeout / time.Millisecond),
-			MemberId:       member_id,
-			ProtocolType:   "consumer", // we implement the standard kafka 0.9 consumer protocol metadata
-		}
-
-		cl.lock.Lock()
-		var topics = make([]string, 0, len(cl.consumers))
-		for topic := range cl.consumers {
-			topics = append(topics, topic)
-		}
-		cl.lock.Unlock()
-
-		jreq.AddGroupProtocolMetadata("roundrobin", &sarama.ConsumerGroupMemberMetadata{
-			Version: 1,
-			Topics:  topics,
-		})
-
-		jresp, err := coor.JoinGroup(jreq)
-		if err != nil || jresp.Err == sarama.ErrNotCoordinatorForConsumer {
-			refresh_coor = true // some I/O error happened, or the broker told us it is no longer the coordinator. in either case we should recompute the coordinator
-		}
-		if err == nil && jresp.Err != 0 {
-			err = jresp.Err
-		}
-		if err != nil {
-			err = cl.makeError("joining group", err)
-			// if it is still early (the 1st iteration of this loop) then return the error and bail out
-			if early_rc != nil {
-				early_rc <- err
-				return
-			}
-			// TODO where to deliver err?
-			// maybe send it to sarama.Logger?
-
-			pause = true
-			continue join_loop
-		}
-
-		// we managed to get a successfull join-group response. that is far enough that basic communication is functioning
-		// and we can declare that our early_rc is success and release the caller to NewClient
-		if early_rc != nil {
-			early_rc <- nil
-			early_rc = nil
-		}
-
-		// save our member_id for next time we join
-		member_id = jresp.MemberId
-
-		// TODO map partitions if leader
-
-		// TODO send SyncGroup
-
-		// start the heartbeat timer
-		heartbeat_timer := time.After(cl.config.Heartbeat.Interval)
-
-		// and loop, sending heartbeats until something happens and we need to rejoin or exit
-	heartbeat_loop:
-		for {
-			select {
-			case <-cl.closed:
-				// cl.Close() has been called; time to exit
-				resp, err := coor.LeaveGroup(&sarama.LeaveGroupRequest{
-					GroupId:  cl.group_name,
-					MemberId: jresp.MemberId,
-				})
-				if err == nil && resp.Err != 0 {
-					err = resp.Err
-				}
-				if err != nil {
-					err = cl.makeError("leaving group", err)
-				}
-				// TODO where to deliver err?
-
-				// and we're done
-				return
-
-			case <-cl.rejoin:
-				// force a rejoin immediately
-				continue join_loop
-
-			case <-heartbeat_timer:
-				// send a heartbeat
-				resp, err := coor.Heartbeat(&sarama.HeartbeatRequest{
-					GroupId:      cl.group_name,
-					MemberId:     jresp.MemberId,
-					GenerationId: jresp.GenerationId,
-				})
-				if err != nil || resp.Err == sarama.ErrNotCoordinatorForConsumer {
-					refresh_coor = true
-				}
-				if err != nil || resp.Err != 0 {
-					// we've got heartbeat troubles of one kind or another; disconnect and reconnect
-					if resp.Err == sarama.ErrNotCoordinatorForConsumer {
-						cl.client.RefreshCoordinator(cl.group_name)
-					}
-					break heartbeat_loop
-				}
-
-				// and start the next heartbeat only after we get the response to this one
-				// that way when the network or the broker are slow we back off.
-				heartbeat_timer = time.After(cl.config.Heartbeat.Interval)
-			}
 		}
 	}
 }
