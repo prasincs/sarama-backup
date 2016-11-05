@@ -214,6 +214,7 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 		messages:    make(chan *sarama.ConsumerMessage),
 		errors:      make(chan error),
 		assignments: make(chan assignment, 1),
+		done:        make(chan *sarama.ConsumerMessage), // TODO give ourselves some capacity
 	}
 
 	reply := make(chan error)
@@ -538,6 +539,8 @@ type consumer struct {
 	close_once sync.Once     // Once used to make sure we close only once
 
 	assignments chan assignment // channel over which the client.run sends consumer.run each generation's partition assignments
+
+	done chan *sarama.ConsumerMessage // channel through which Done() returns messages
 }
 
 // assignment is this client's assigned partitions
@@ -550,9 +553,6 @@ type assignment struct {
 
 func (con *consumer) Messages() <-chan *sarama.ConsumerMessage { return con.messages }
 func (con *consumer) Errors() <-chan error                     { return con.errors }
-
-func (con *consumer) Done(*sarama.ConsumerMessage) {
-}
 
 // close the consumer. it can safely be called multiple times
 func (con *consumer) AsyncClose() {
@@ -625,6 +625,30 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 
 	for {
 		select {
+		case msg := <-con.done:
+			partition := partitions[msg.Partition]
+			if partition == nil {
+				continue
+			}
+			delta := partition.oldest - msg.Offset
+			if delta < 0 { // || delta > max-out-of-order  (TODO)
+				continue
+			}
+			index := int(delta) >> 6 //  /64
+			if index >= len(partition.buckets) {
+				continue
+			}
+			partition.buckets[index]--
+			if index == 0 {
+				// we might have finished the oldest bucket
+				for partition.buckets[0] == 0 {
+					// the oldest bucket is complete; advance the last comitted offset
+					partition.offset += 64
+					partition.oldest = partition.offset
+					partition.buckets = partition.buckets[1:]
+				}
+			}
+
 		case <-con.closed:
 			// the defered operations do the work
 			return
@@ -678,6 +702,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 					partitions[p] = &partition{
 						consumer: consumer,
 						offset:   offset.Offset,
+						oldest:   offset.Offset,
 					}
 				}
 			}
@@ -685,10 +710,20 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 	}
 }
 
+func (con *consumer) Done(msg *sarama.ConsumerMessage) {
+	// send it back to consumer.run to be processed synchronously
+	con.done <- msg
+}
+
 // partition contains the data associated with us consuming one partition
 type partition struct {
 	consumer sarama.PartitionConsumer
 	offset   int64 // newest comittable offset
+	// buckets of # of offsets outstanding
+	// we group offsets in groups of 64 and simply keep a count of how many are outstanding
+	// once all are returned then all offsets in the group are comittable.
+	buckets []uint8
+	oldest  int64 // 1st offset in oldest bucket
 }
 
 // difference returns the differences (additions and subtractions) between two slices of int32.
