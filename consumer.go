@@ -36,10 +36,8 @@ type Config struct {
 	Offsets struct {
 		// The minimum interval between offset commits (defaults to 1s)
 		Interval time.Duration
-		Retry    struct {
-			// The number of retries when comitting offsets (defaults to 3).
-			Max int
-		}
+		// retention time of the committed offsets at the broker (defaults to 0 and the broker's value is used)
+		RetentionTime time.Duration
 	}
 	Session struct {
 		// The allowed session timeout for registered consumers (defaults to 30s).
@@ -65,7 +63,7 @@ type Config struct {
 func NewConfig() *Config {
 	cfg := &Config{}
 	cfg.Offsets.Interval = 1 * time.Second
-	cfg.Offsets.Retry.Max = 3
+	cfg.Offsets.RetentionTime = 0 // use the server's default value
 	cfg.Session.Timeout = 30 * time.Second
 	cfg.Rebalance.Timeout = 30 * time.Second
 	cfg.Heartbeat.Interval = 3 * time.Second
@@ -91,7 +89,7 @@ func NewClient(group_name string, config *Config, sarama_client sarama.Client) (
 		config:     config,
 		group_name: group_name,
 
-		errors: make(chan error),
+		errors: make(chan error, 10), // don't buffer more than a handful of asynchronous errors
 
 		closed:       make(chan struct{}),
 		add_consumer: make(chan add_consumer),
@@ -211,7 +209,7 @@ type add_consumer struct {
 
 func (cl *client) Consume(topic string) (Consumer, error) {
 	con := &consumer{
-		client:      cl,
+		cl:          cl,
 		topic:       topic,
 		messages:    make(chan *sarama.ConsumerMessage),
 		errors:      make(chan error),
@@ -235,7 +233,6 @@ func (cl *client) Close() {
 // long lived goroutine which manages this client's membership in the consumer group
 func (cl *client) run(early_rc chan<- error) {
 	var member_id string                    // our group member id, assigned to us by kafka when we first make contact
-	var generation_id int32                 // our current generation id
 	consumers := make(map[string]*consumer) // map of topic -> consumer
 	var wg sync.WaitGroup                   // waitgroup used to wait for all consumers to exit
 
@@ -245,12 +242,17 @@ func (cl *client) run(early_rc chan<- error) {
 			// topic already is being consumed. the way the standard kafka 0.9 group coordination works you cannot consume twice with the
 			// same client. If you want to consume the same topic twice, use two Clients.
 			add.reply <- cl.makeError("Consume", fmt.Errorf("topic %q is already being consumed", add.con.topic))
-		} else {
-			consumers[add.con.topic] = add.con
-			add.reply <- nil
+			return
 		}
+		sarama_consumer, err := sarama.NewConsumerFromClient(cl.client)
+		if err != nil {
+			add.reply <- cl.makeError("Consume sarama.NewConsumerFromClient", err)
+			return
+		}
+		consumers[add.con.topic] = add.con
 		wg.Add(1)
-		go add.con.run(generation_id, &wg)
+		go add.con.run(sarama_consumer, &wg)
+		add.reply <- nil
 	}
 	// remove a consumer
 	rem := func(con *consumer) {
@@ -296,6 +298,7 @@ func (cl *client) run(early_rc chan<- error) {
 						// shutdown the remaining consumers
 						shutdown()
 						return
+
 					case a := <-cl.add_consumer:
 						add(a)
 					case r := <-cl.rem_consumer:
@@ -364,7 +367,7 @@ func (cl *client) run(early_rc chan<- error) {
 
 			// save our member_id for next time we join, and the new generation id
 			member_id = jresp.MemberId
-			generation_id = jresp.GenerationId
+			generation_id := jresp.GenerationId
 
 			// prepare a sync request
 			sreq := &sarama.SyncGroupRequest{
@@ -379,6 +382,9 @@ func (cl *client) run(early_rc chan<- error) {
 				if err != nil {
 					cl.deliverError("partitioning", err)
 				}
+				// and rejoin (thus aborting this generation) since we can't partition it as needed
+				pause = true
+				continue join_loop
 			}
 
 			// send SyncGroup
@@ -406,6 +412,8 @@ func (cl *client) run(early_rc chan<- error) {
 			// save and distribute the new assignments to our topic consumers
 			a := assignment{
 				generation_id: generation_id,
+				coordinator:   coor,
+				member_id:     member_id,
 				assignments:   assignments,
 			}
 			for _, con := range consumers {
@@ -520,22 +528,23 @@ func (cl *client) deliverError(context string, err error) {
 
 // consumer implements the Consumer interface
 type consumer struct {
-	client *client
-	topic  string
+	cl    *client
+	topic string
 
 	messages chan *sarama.ConsumerMessage
 	errors   chan error
 
-	wg         sync.WaitGroup // waitgroup signaling when all partition consumers have exited
-	closed     chan struct{}  // channel which is closed when the consumed is Close()ed
-	close_once sync.Once      // Once used to make sure we close only once
+	closed     chan struct{} // channel which is closed when the consumer is AsyncClose()ed
+	close_once sync.Once     // Once used to make sure we close only once
 
 	assignments chan assignment // channel over which the client.run sends consumer.run each generation's partition assignments
 }
 
 // assignment is this client's assigned partitions
 type assignment struct {
-	generation_id int32
+	generation_id int32              // the current generation
+	coordinator   *sarama.Broker     // the current client-group coordinating broker
+	member_id     string             // the member_id assigned to us by the coordinator
 	assignments   map[string][]int32 // map of topic -> list of partitions
 }
 
@@ -551,72 +560,166 @@ func (con *consumer) AsyncClose() {
 }
 
 // consumer goroutine
-func (con *consumer) run(generation_id int32, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 
-	var partitions []int32 //  our current partition assignment
+	var generation_id int32 // current generation
+	var coor *sarama.Broker // current consumer group coordinating broker
+	var member_id string    // our member id assigned by coor
 
-	partition_consumers := make(map[int32]chan int32) // map of partition -> channel used to command them
+	partitions := make(map[int32]*partition) // map of partition -> sarama consumer
+
+	// shutdown the removed partitions, comitting their last offset
+	remove := func(removed []int32) {
+		if len(removed) != 0 {
+			ocreq := &sarama.OffsetCommitRequest{
+				ConsumerGroup:           con.cl.group_name,
+				ConsumerGroupGeneration: generation_id,
+				ConsumerID:              member_id,
+				RetentionTime:           int64(con.cl.config.Offsets.RetentionTime / time.Millisecond),
+				Version:                 2, // kafka 0.9.0 version, with RetentionTime
+			}
+			if con.cl.config.Offsets.RetentionTime == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
+				ocreq.RetentionTime = -1 // use broker's value
+			}
+			for _, p := range removed {
+				// stop consuming from partition p
+				if partition, ok := partitions[p]; ok {
+					delete(partitions, p)
+					partition.consumer.Close()
+					ocreq.AddBlock(con.topic, p, partition.offset, 0, "")
+				}
+			}
+			ocresp, err := coor.CommitOffset(ocreq)
+			// log any errors we got. there isn't much we can do about them; the next consumer will start at an older offset
+			if err != nil {
+				con.cl.deliverError("comitting offsets", err)
+			} else {
+				for topic, partitions := range ocresp.Errors {
+					for partition, err := range partitions {
+						con.cl.deliverError(fmt.Sprintf("comitting offset if topic %q partition %d", topic, partition), err)
+					}
+				}
+			}
+		}
+		if len(removed) == 0 {
+			return
+		}
+	}
+
+	defer func() {
+		if len(partitions) != 0 {
+			// cleanup the remaining partition consumers
+			removed := make([]int32, 0, len(partitions))
+			for p := range partitions {
+				removed = append(removed, p)
+			}
+			remove(removed)
+		}
+
+		sarama_consumer.Close()
+		close(con.messages)
+		close(con.errors)
+		con.cl.rem_consumer <- con
+		wg.Done()
+	}()
 
 	for {
 		select {
 		case <-con.closed:
-			// wait for the partition consumers to shutdown
-			con.wg.Wait()
-			// and close the output channels
-			close(con.messages)
-			close(con.errors)
-			con.client.rem_consumer <- con
-			// and we're done
+			// the defered operations do the work
 			return
 
 		case a := <-con.assignments:
-			// see if we've gotten a different partition assignment than the current one
+			// see what has changed in the partition assignment of our topic
 			new_partitions := a.assignments[con.topic]
-			generation_id = a.generation_id
 			added, removed := difference(partitions, new_partitions)
-			for _, p := range removed {
-				// stop consuming from partition p
-				if command, ok := partition_consumers[p]; ok {
-					delete(partition_consumers, p)
-					command <- -1 // generation -1 is a magic value within the kafka offset API, so we reuse it here to indicate a stop
-				}
+
+			// shutdown the partitions while in the previous generation
+			remove(removed)
+
+			// update the current generation and related info after comitting the last offsets from the previous generation
+			generation_id = a.generation_id
+			coor = a.coordinator
+			member_id = a.member_id
+
+			// fetch the last comitted offsets of the new partitions
+			oreq := &sarama.OffsetFetchRequest{
+				ConsumerGroup: con.cl.group_name,
+				Version:       1, // kafka 0.9.0 expects version 1 offset requests
 			}
 			for _, p := range added {
-				// start consuming from partition p
-				command := make(chan int32)
-				partition_consumers[p] = command
-				// TODO NSD HERE
+				oreq.AddPartition(con.topic, p)
+			}
+			oresp, err := a.coordinator.FetchOffset(oreq)
+			if err != nil {
+				con.cl.deliverError(fmt.Sprintf("fetching offsets for topic %q", con.topic), err)
+				// and we can't consume any of the new partitions without the offsets
+			} else {
+				for _, p := range added {
+					// start consuming from partition p at the last committed offset (which by convention kafaka defines as the last consumed offset+1)
+					offset := oresp.GetBlock(con.topic, p)
+					if offset == nil {
+						// can't start this partition without an offset
+						con.cl.deliverError("FetchOffset response", fmt.Errorf("topic %q partition %d missing", con.topic, p))
+						continue
+					}
+					if offset.Err != 0 {
+						con.cl.deliverError(fmt.Sprintf("FetchOffset error for topic %q partition %d", con.topic, p), offset.Err)
+						continue
+					}
+
+					consumer, err := sarama_consumer.ConsumePartition(con.topic, p, offset.Offset)
+					if err != nil {
+						con.cl.deliverError(fmt.Sprintf("sarama.ConsumePartition(%q, %d, %d)", con.topic, p, offset.Offset), err)
+						// and we can't consume this one
+						continue
+					}
+
+					partitions[p] = &partition{
+						consumer: consumer,
+						offset:   offset.Offset,
+					}
+				}
 			}
 		}
 	}
 }
 
+// partition contains the data associated with us consuming one partition
+type partition struct {
+	consumer sarama.PartitionConsumer
+	offset   int64 // newest comittable offset
+}
+
 // difference returns the differences (additions and subtractions) between two slices of int32.
 // typically the slices contain partition numbers.
-func difference(a, b []int32) (added, removed []int32) {
-	// can we assume a and b are sorted? The kafka spec doesn't say anything about partition lists being sorted, so best not to do so
-	x, y := make(int32Slice, len(a)), make(int32Slice, len(b))
-	copy(x, a)
-	sort.Sort(x)
-	copy(y, b)
-	sort.Sort(y)
+func difference(old map[int32]*partition, next []int32) (added, removed []int32) {
+	o := make(int32Slice, 0, len(old))
+	for p := range old {
+		o = append(o, p)
+	}
+
+	n := make(int32Slice, len(next))
+	copy(n, next)
+
+	sort.Sort(o)
+	sort.Sort(n)
 
 	i, j := 0, 0
-	for i < len(x) && j < len(y) {
-		if x[i] < y[j] {
-			removed = append(removed, x[i])
+	for i < len(o) && j < len(n) {
+		if o[i] < n[j] {
+			removed = append(removed, o[i])
 			i++
-		} else if x[i] > y[j] {
-			added = append(added, y[j])
+		} else if o[i] > n[j] {
+			added = append(added, n[j])
 			j++
 		} else {
 			i++
 			j++
 		}
 	}
-	removed = append(removed, x[i:]...)
-	added = append(added, y[j:]...)
+	removed = append(removed, o[i:]...)
+	added = append(added, n[j:]...)
 
 	return
 }
