@@ -397,7 +397,7 @@ join_loop:
 		sreq := &sarama.SyncGroupRequest{
 			GroupId:      cl.group_name,
 			GenerationId: generation_id,
-			MemberId:     jresp.MemberId,
+			MemberId:     member_id,
 		}
 
 		// we have been chosen as the leader then we have to map the partitions
@@ -405,10 +405,10 @@ join_loop:
 			err := cl.config.Partitioner.Partition(sreq, jresp, cl.client)
 			if err != nil {
 				cl.deliverError("partitioning", err)
+				// and rejoin (thus aborting this generation) since we can't partition it as needed
+				pause = true
+				continue join_loop
 			}
-			// and rejoin (thus aborting this generation) since we can't partition it as needed
-			pause = true
-			continue join_loop
 		}
 
 		// send SyncGroup
@@ -426,7 +426,6 @@ join_loop:
 			continue join_loop
 		}
 		assignments, err := cl.config.Partitioner.ParseSync(sresp)
-		sresp.GetMemberAssignment()
 		if err != nil {
 			cl.deliverError("decoding member assignments", err)
 			pause = true
