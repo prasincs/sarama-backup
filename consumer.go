@@ -465,10 +465,11 @@ join_loop:
 			select {
 			case <-cl.closed:
 				// cl.Close() has been called; time to exit
-				resp, err := coor.LeaveGroup(&sarama.LeaveGroupRequest{
+				req := &sarama.LeaveGroupRequest{
 					GroupId:  cl.group_name,
-					MemberId: jresp.MemberId,
-				})
+					MemberId: member_id,
+				}
+				resp, err := coor.LeaveGroup(req)
 				if err == nil && resp.Err != 0 {
 					err = resp.Err
 				}
@@ -484,11 +485,12 @@ join_loop:
 
 			case <-heartbeat_timer:
 				// send a heartbeat
-				resp, err := coor.Heartbeat(&sarama.HeartbeatRequest{
+				req := &sarama.HeartbeatRequest{
 					GroupId:      cl.group_name,
 					MemberId:     member_id,
 					GenerationId: generation_id,
-				})
+				}
+				resp, err := coor.Heartbeat(req)
 				if err != nil || resp.Err == sarama.ErrNotCoordinatorForConsumer {
 					// we need a new coordinator
 					refresh = true
@@ -896,7 +898,7 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 		return err
 	}
 	// invert the data, so we have the requests grouped by topic (they arrived grouped by member, since the kafka broker treats the data from each consumer as an opaque blob, so it couldn't do this step for us)
-	by_topic := make(map[string][]string)
+	by_topic := make(map[string][]string) // map of topic to members requesting the topic
 	for member, request := range by_member {
 		if request.Version != 1 {
 			// skip unsupported versions. we'll only assign to clients we can understand. Since we are such a client
@@ -909,7 +911,7 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 		}
 	}
 
-	// finally, build our map the partitions of each topic
+	// finally, build our assignments of partitions to members
 	assignments := make(map[string]map[string][]int32) // map of member to topics, and topic to partitions
 	for topic, members := range by_topic {
 		partitions, err := client.Partitions(topic)
@@ -918,19 +920,24 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 			// so let's stop partitioning and return the error.
 			return err
 		}
-		if len(partitions) == 0 { // can this happen? best not to /0 later if it can
+		n := len(partitions)
+		if n == 0 { // can this happen? best not to /0 later if it can
 			// no one gets anything assigned. it is as if this topic didn't exist
 			continue
 		}
 
-		for i, member_id := range members {
-			topics, ok := assignments[member_id]
-			if !ok {
-				topics = make(map[string][]int32)
-				assignments[member_id] = topics
+		for i := 0; i < n; i++ {
+			for _, member_id := range members {
+				topics, ok := assignments[member_id]
+				if !ok {
+					topics = make(map[string][]int32)
+					assignments[member_id] = topics
+				}
+				topics[topic] = append(topics[topic], partitions[i])
+				if i+1 == n {
+					break
+				}
 			}
-			partition := partitions[i%len(partitions)] // the round-robin bit (in case anyone lost track in all the mappings)
-			topics[topic] = append(topics[topic], partition)
 		}
 	}
 
@@ -950,6 +957,9 @@ func (*RoundRobin) ParseSync(sresp *sarama.SyncGroupResponse) (map[string][]int3
 	ma, err := sresp.GetMemberAssignment()
 	if err != nil {
 		return nil, err
+	}
+	if ma == nil {
+		return nil, nil
 	}
 	if ma.Version != 1 {
 		return nil, fmt.Errorf("unsupported MemberAssignment version %d", ma.Version)
