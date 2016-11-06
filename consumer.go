@@ -686,39 +686,57 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		for _, p := range added {
 			oreq.AddPartition(con.topic, p)
 		}
+
 		oresp, err := a.coordinator.FetchOffset(oreq)
 		if err != nil {
 			con.cl.deliverError(fmt.Sprintf("fetching offsets for topic %q", con.topic), err)
 			// and we can't consume any of the new partitions without the offsets
-		} else {
+		} else if len(added) != 0 {
+			// start consuming from the added partitions at each partition's last committed offset (which by convention kafaka defines as the last consumed offset+1)
+			// since computing the starting offset and beginning to consume requires several round trips to the kafka brokers we start all the
+			// partitions concurrently. That reduces the startup time to a couple RTTs even for topics with a numerous partitions.
+			started := make(chan *partition)
+			var wg sync.WaitGroup
 			for _, p := range added {
-				// start consuming from partition p at the last committed offset (which by convention kafaka defines as the last consumed offset+1)
-				offset := oresp.GetBlock(con.topic, p)
-				if offset == nil {
-					// can't start this partition without an offset
-					con.cl.deliverError("FetchOffset response", fmt.Errorf("topic %q partition %d missing", con.topic, p))
-					continue
-				}
-				if offset.Err != 0 {
-					con.cl.deliverError(fmt.Sprintf("FetchOffset error for topic %q partition %d", con.topic, p), offset.Err)
-					continue
-				}
+				wg.Add(1)
+				go func(p int32) {
+					defer wg.Done()
+					offset := oresp.GetBlock(con.topic, p)
+					if offset == nil {
+						// can't start this partition without an offset
+						con.cl.deliverError("FetchOffset response", fmt.Errorf("topic %q partition %d missing", con.topic, p))
+						return
+					}
+					if offset.Err != 0 {
+						con.cl.deliverError(fmt.Sprintf("FetchOffset error for topic %q partition %d", con.topic, p), offset.Err)
+						return
+					}
 
-				consumer, err := sarama_consumer.ConsumePartition(con.topic, p, offset.Offset)
-				if err != nil {
-					con.cl.deliverError(fmt.Sprintf("sarama.ConsumePartition(%q, %d, %d)", con.topic, p, offset.Offset), err)
-					// and we can't consume this one
-					continue
-				}
+					consumer, err := sarama_consumer.ConsumePartition(con.topic, p, offset.Offset)
+					if err != nil {
+						con.cl.deliverError(fmt.Sprintf("sarama.ConsumePartition(%q, %d, %d)", con.topic, p, offset.Offset), err)
+						// and we can't consume this one
+						return
+					}
 
-				partition := &partition{
-					consumer: consumer,
-					offset:   offset.Offset,
-					oldest:   offset.Offset,
-				}
-				partitions[p] = partition
+					partition := &partition{
+						consumer:  consumer,
+						partition: p,
+						offset:    offset.Offset,
+						oldest:    offset.Offset,
+					}
+					go partition.run(con)
 
-				go partition.run(con)
+					started <- partition
+				}(p)
+			}
+			go func() {
+				wg.Wait()
+				close(started)
+			}()
+
+			for partition := range started {
+				partitions[partition.partition] = partition
 			}
 		}
 	}
@@ -778,8 +796,9 @@ func (con *consumer) Done(msg *sarama.ConsumerMessage) {
 
 // partition contains the data associated with us consuming one partition
 type partition struct {
-	consumer sarama.PartitionConsumer
-	offset   int64 // newest comittable offset
+	consumer  sarama.PartitionConsumer
+	partition int32 // partition number
+	offset    int64 // newest comittable offset
 	// buckets of # of offsets outstanding
 	// we group offsets in groups of 64 and simply keep a count of how many are outstanding
 	// once all are returned then all offsets in the group are comittable.
