@@ -537,7 +537,6 @@ join_loop:
 			}
 		} // end of heartbeat_loop
 	} // end of join_loop
-
 }
 
 // makeError builds an Error from an error from a lower level api (typically the sarama API)
@@ -665,14 +664,17 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		dbgf("consumer %q done(%d/%d)", con.topic, msg.Partition, msg.Offset)
 		partition := partitions[msg.Partition]
 		if partition == nil {
+			dbgf("no partition %d", msg.Partition)
 			return
 		}
-		delta := partition.oldest - msg.Offset
-		if delta < 0 { // || delta > max-out-of-order  (TODO)
+		delta := msg.Offset - partition.oldest
+		if delta < 0 {
+			dbgf("stale message %d/%d", msg.Partition, msg.Offset)
 			return
 		}
 		index := int(delta) >> 6 //  /64
 		if index >= len(partition.buckets) {
+			dbgf("early message %d/%d", msg.Partition, msg.Offset)
 			return
 		}
 		partition.buckets[index]--
@@ -774,14 +776,17 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-con.premessages:
+			dbgf("premessage msg %d/%d", msg.Partition, msg.Offset)
 			// keep track of msg's offset so we can match it with Done, and deliver the msg
 			partition := partitions[msg.Partition]
 			if partition == nil {
 				// message from a stale consumer; ignore it
+				dbgf("no partition %d", msg.Partition)
 				continue
 			}
-			delta := partition.oldest - msg.Offset
+			delta := msg.Offset - partition.oldest
 			if delta < 0 { // || delta > max-out-of-order  (TODO)
+				dbgf("stale message %d/%d", msg.Partition, msg.Offset)
 				// we can't take this message into account
 				continue
 			}
@@ -795,11 +800,12 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			for {
 				select {
 				case con.messages <- msg:
+					dbgf("delivered msg %d/%d", msg.Partition, msg.Offset)
 					// success
 					break
 
-				case msg := <-con.done:
-					done(msg)
+				case msg2 := <-con.done:
+					done(msg2)
 				case a := <-con.assignments:
 					assignment(a)
 				case <-con.closed:
@@ -821,6 +827,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 
 func (con *consumer) Done(msg *sarama.ConsumerMessage) {
 	// send it back to consumer.run to be processed synchronously
+	dbgf("Done(%d/%d)", msg.Partition, msg.Offset)
 	con.done <- msg
 }
 
@@ -844,12 +851,14 @@ func (partition *partition) run(con *consumer) {
 		select {
 		case msg, ok := <-msgs:
 			if ok {
+				dbgf("got msg %d/%d", msg.Partition, msg.Offset)
 				select {
 				case con.premessages <- msg:
 				case <-con.closed:
 					return
 				}
 			} else {
+				dbgf("draining topic %q partition %d errors", con.topic, partition.partition)
 				// finish off any remaining errors, and exit
 				for sarama_err := range errors {
 					err := con.makeConsumerError(sarama_err)
@@ -871,6 +880,7 @@ func (partition *partition) run(con *consumer) {
 				}
 			} else {
 				// finish off any remaining messages, and exit
+				dbgf("draining topic %q partition %d msgs", con.topic, partition.partition)
 				for msg := range msgs {
 					select {
 					case con.premessages <- msg:
@@ -978,7 +988,7 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 			continue
 		}
 
-		for i := 0; i < n; i++ {
+		for i := 0; i < n; {
 			for _, member_id := range members {
 				topics, ok := assignments[member_id]
 				if !ok {
@@ -986,7 +996,8 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 					assignments[member_id] = topics
 				}
 				topics[topic] = append(topics[topic], partitions[i])
-				if i+1 == n {
+				i++
+				if i == n {
 					break
 				}
 			}
