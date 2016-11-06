@@ -699,11 +699,14 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 						continue
 					}
 
-					partitions[p] = &partition{
+					partition := &partition{
 						consumer: consumer,
 						offset:   offset.Offset,
 						oldest:   offset.Offset,
 					}
+					partitions[p] = partition
+
+					go partition.run(con)
 				}
 			}
 		}
@@ -724,6 +727,59 @@ type partition struct {
 	// once all are returned then all offsets in the group are comittable.
 	buckets []uint8
 	oldest  int64 // 1st offset in oldest bucket
+}
+
+// run consumes from the partition and delivers it to the consumer
+func (partition *partition) run(con *consumer) {
+	msgs := partition.consumer.Messages()
+	errors := partition.consumer.Errors()
+	for {
+		select {
+		case msg, ok := <-msgs:
+			if ok {
+				select {
+				case con.messages <- msg:
+				case <-con.closed:
+					return
+				}
+			} else {
+				// finish off any remaining errors, and exit
+				for sarama_err := range errors {
+					err := con.makeConsumerError(sarama_err)
+					select {
+					case con.errors <- err:
+					case <-con.closed:
+						return
+					}
+				}
+				return
+			}
+		case sarama_err, ok := <-errors:
+			if ok {
+				err := con.makeConsumerError(sarama_err)
+				select {
+				case con.errors <- err:
+				case <-con.closed:
+					return
+				}
+			} else {
+				// finish off any remaining messages, and exit
+				for msg := range msgs {
+					select {
+					case con.messages <- msg:
+					case <-con.closed:
+						return
+					}
+				}
+				return
+			}
+		}
+	}
+}
+
+// wrap a sarama.ConsumerError
+func (con *consumer) makeConsumerError(cerr *sarama.ConsumerError) error {
+	return con.cl.makeError(fmt.Sprintf("consuming topic %q partition %d", cerr.Topic, cerr.Partition), cerr.Err)
 }
 
 // difference returns the differences (additions and subtractions) between two slices of int32.
