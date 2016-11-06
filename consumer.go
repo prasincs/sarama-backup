@@ -954,12 +954,13 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 }
 
 func (*RoundRobin) ParseSync(sresp *sarama.SyncGroupResponse) (map[string][]int32, error) {
+	if len(sresp.MemberAssignment) == 0 {
+		// in the corner case that we ask for no topics, we get nothing back. However sarama fd498173ae2bf (head of master branch Nov 6th 2016) will return a useless error if we call sresp.GetMemberAssignment() in this case
+		return nil, nil
+	}
 	ma, err := sresp.GetMemberAssignment()
 	if err != nil {
 		return nil, err
-	}
-	if ma == nil {
-		return nil, nil
 	}
 	if ma.Version != 1 {
 		return nil, fmt.Errorf("unsupported MemberAssignment version %d", ma.Version)
