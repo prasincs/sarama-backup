@@ -622,17 +622,29 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 				if partition, ok := partitions[p]; ok {
 					delete(partitions, p)
 					partition.consumer.Close()
-					ocreq.AddBlock(con.topic, p, partition.offset, 0, "")
+					offset := partition.oldest
+					if len(partition.buckets) != 0 {
+						if partition.buckets[0][0] == partition.buckets[0][1] {
+							// add to that the portion of the last block we know been completed (this is often useful when a client shuts down cleanly, since it has probably cleanly returned all offsets we've delivered)
+							offset += int64(partition.buckets[0][1])
+						} // else we don't know enough to commit any further
+					}
+					dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
+					ocreq.AddBlock(con.topic, p, offset, 0, "")
 				}
 			}
+			dbgf("sending OffsetCommitRequest %v", ocreq)
 			ocresp, err := coor.CommitOffset(ocreq)
+			dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
 			// log any errors we got. there isn't much we can do about them; the next consumer will start at an older offset
 			if err != nil {
 				con.cl.deliverError("comitting offsets", err)
 			} else {
 				for topic, partitions := range ocresp.Errors {
 					for partition, err := range partitions {
-						con.cl.deliverError(fmt.Sprintf("comitting offset of topic %q partition %d", topic, partition), err)
+						if err != 0 {
+							con.cl.deliverError(fmt.Sprintf("comitting offset of topic %q partition %d", topic, partition), err)
+						}
 					}
 				}
 			}
@@ -677,13 +689,12 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			dbgf("early message %d/%d", msg.Partition, msg.Offset)
 			return
 		}
-		partition.buckets[index]--
+		partition.buckets[index][1]++
 		if index == 0 {
 			// we might have finished the oldest bucket
-			for partition.buckets[0] == 0 {
+			for partition.buckets[0] == [2]uint8{64, 64} {
 				// the oldest bucket is complete; advance the last comitted offset
-				partition.offset += 64
-				partition.oldest = partition.offset
+				partition.oldest += 64
 				partition.buckets = partition.buckets[1:]
 			}
 		}
@@ -754,7 +765,6 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 					partition := &partition{
 						consumer:  consumer,
 						partition: p,
-						offset:    offset.Offset,
 						oldest:    offset.Offset,
 					}
 					go partition.run(con)
@@ -784,6 +794,10 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 				dbgf("no partition %d", msg.Partition)
 				continue
 			}
+			if partition.oldest == sarama.OffsetNewest || partition.oldest == sarama.OffsetOldest {
+				// we now know the starting offset. make as if we'd been asked to start there
+				partition.oldest = msg.Offset
+			}
 			delta := msg.Offset - partition.oldest
 			if delta < 0 { // || delta > max-out-of-order  (TODO)
 				dbgf("stale message %d/%d", msg.Partition, msg.Offset)
@@ -793,8 +807,9 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			index := int(delta) >> 6 //  /64
 			for index >= len(partition.buckets) {
 				// add a new bucket
-				partition.buckets = append(partition.buckets, 64)
+				partition.buckets = append(partition.buckets, [2]uint8{0, 0})
 			}
+			partition.buckets[index][0]++
 
 			// and deliver the msg (or handle any of the other messages which can arrive)
 		deliver_loop:
@@ -836,12 +851,11 @@ func (con *consumer) Done(msg *sarama.ConsumerMessage) {
 type partition struct {
 	consumer  sarama.PartitionConsumer
 	partition int32 // partition number
-	offset    int64 // newest comittable offset
-	// buckets of # of offsets outstanding
+	// buckets of # of offsets read from kafka, and the # of offsets completed by a call to Done(). the difference is the # of offsets in flight in the calling code
 	// we group offsets in groups of 64 and simply keep a count of how many are outstanding
-	// once all are returned then all offsets in the group are comittable.
-	buckets []uint8
-	oldest  int64 // 1st offset in oldest bucket
+	// any time the two counts are equal then the offsets are comittable. Otherwise we can't tell which is the not yet Done() offset and so we don't know
+	buckets [][2]uint8
+	oldest  int64 // 1st offset in bucket[0]
 }
 
 // run consumes from the partition and delivers it to the consumer
@@ -873,6 +887,7 @@ func (partition *partition) run(con *consumer) {
 			}
 		case sarama_err, ok := <-errors:
 			if ok {
+				// TODO handle "you asked for a too old a message" by jumping ahead? make that configurable, but typically that's all you can do anyway
 				err := con.makeConsumerError(sarama_err)
 				select {
 				case con.errors <- err:
