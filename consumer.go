@@ -8,12 +8,22 @@ package consumer
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/Shopify/sarama"
 )
+
+const debug = true // set to true to see log messages
+
+// dbgf logs a printf style message to somewhere reasonable if debug is enabled, and as efficiently as it can does nothing with any side effects if debug is disabled
+func dbgf(fmt string, args ...interface{}) {
+	if debug {
+		log.Printf(fmt, args...)
+	}
+}
 
 // minimum kafka API version required. Use this when constructing the sarama.Client's sarama.Config.MinVersion
 var MinVersion = sarama.V0_9_0_0
@@ -148,7 +158,7 @@ type Consumer interface {
 
 	// Done indicates the processing of the message is complete, and its offset can
 	// be comitted to kafka. Calling Done twice with the same message, or with a
-	// garbage message, can cause panics.
+	// garbage message, can cause trouble.
 	Done(*sarama.ConsumerMessage)
 
 	// Errors returns the channel of errors. These include errors from the underlying
@@ -346,6 +356,7 @@ join_loop:
 			refresh = true
 			continue join_loop
 		}
+		dbgf("Coordinator %v", coor)
 
 		// join the group
 		jreq := &sarama.JoinGroupRequest{
@@ -361,7 +372,9 @@ join_loop:
 		}
 		cl.config.Partitioner.PrepareJoin(jreq, topics)
 
+		dbgf("sending JoinGroupRequest %v", jreq)
 		jresp, err := coor.JoinGroup(jreq)
+		dbgf("received JoinGroupResponse %v, %v", jresp, err)
 		if err != nil || jresp.Err == sarama.ErrNotCoordinatorForConsumer {
 			// some I/O error happened, or the broker told us it is no longer the coordinator. in either case we should recompute the coordinator
 			refresh = true
@@ -392,6 +405,7 @@ join_loop:
 		// save our member_id for next time we join, and the new generation id
 		member_id = jresp.MemberId
 		generation_id := jresp.GenerationId
+		dbgf("member_id %q, generation_id %d", member_id, generation_id)
 
 		// prepare a sync request
 		sreq := &sarama.SyncGroupRequest{
@@ -402,6 +416,7 @@ join_loop:
 
 		// we have been chosen as the leader then we have to map the partitions
 		if jresp.LeaderId == member_id {
+			dbgf("leader is we")
 			err := cl.config.Partitioner.Partition(sreq, jresp, cl.client)
 			if err != nil {
 				cl.deliverError("partitioning", err)
@@ -412,7 +427,9 @@ join_loop:
 		}
 
 		// send SyncGroup
+		dbgf("sending SyncGroupRequest %v", sreq)
 		sresp, err := coor.SyncGroup(sreq)
+		dbgf("received SyncGroupResponse %v, %v", sresp, err)
 		if err != nil && sresp.Err == sarama.ErrNotCoordinatorForConsumer {
 			// we'll need a new coordinator
 			refresh = true
@@ -469,7 +486,9 @@ join_loop:
 					GroupId:  cl.group_name,
 					MemberId: member_id,
 				}
+				dbgf("sending LeaveGroupRequest %v", req)
 				resp, err := coor.LeaveGroup(req)
+				dbgf("received LeaveGroupResponse %v, %v", resp, err)
 				if err == nil && resp.Err != 0 {
 					err = resp.Err
 				}
@@ -490,7 +509,9 @@ join_loop:
 					MemberId:     member_id,
 					GenerationId: generation_id,
 				}
+				dbgf("sending HeartbeatRequest %v", req)
 				resp, err := coor.Heartbeat(req)
+				dbgf("received HeartbeatResponse %v, %v", resp, err)
 				if err != nil || resp.Err == sarama.ErrNotCoordinatorForConsumer {
 					// we need a new coordinator
 					refresh = true
@@ -533,6 +554,7 @@ func (cl *client) deliverError(context string, err error) {
 	if context != "" {
 		err = cl.makeError(context, err)
 	}
+	dbgf("%v", err)
 	// deliver the error if anyone is listening. otherwise tough
 	select {
 	case cl.errors <- err:
@@ -584,6 +606,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 
 	// shutdown the removed partitions, comitting their last offset
 	remove := func(removed []int32) {
+		dbgf("consumer %q rem(%v)", con.topic, removed)
 		if len(removed) != 0 {
 			ocreq := &sarama.OffsetCommitRequest{
 				ConsumerGroup:           con.cl.group_name,
@@ -639,6 +662,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 
 	// handle a message over con.done
 	done := func(msg *sarama.ConsumerMessage) {
+		dbgf("consumer %q done(%d/%d)", con.topic, msg.Partition, msg.Offset)
 		partition := partitions[msg.Partition]
 		if partition == nil {
 			return
@@ -664,9 +688,11 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 	}
 
 	assignment := func(a *assignment) {
+		dbgf("consumer %q assignment(%v)", con.topic, a)
 		// see what has changed in the partition assignment of our topic
 		new_partitions := a.assignments[con.topic]
 		added, removed := difference(partitions, new_partitions)
+		dbgf("consumer %q added %v, removed %v", con.topic, added, removed)
 
 		// shutdown the partitions while in the previous generation
 		remove(removed)
@@ -687,7 +713,9 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			oreq.AddPartition(con.topic, p)
 		}
 
+		dbgf("consumer %q sending OffsetFetchRequest %v", con.topic, oreq)
 		oresp, err := a.coordinator.FetchOffset(oreq)
+		dbgf("consumer %q received OffsetFetchResponse %v, %v", con.topic, oresp, err)
 		if err != nil {
 			con.cl.deliverError(fmt.Sprintf("fetching offsets for topic %q", con.topic), err)
 			// and we can't consume any of the new partitions without the offsets
@@ -711,6 +739,8 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 						con.cl.deliverError(fmt.Sprintf("FetchOffset error for topic %q partition %d", con.topic, p), offset.Err)
 						return
 					}
+
+					dbgf("consumer %q consuming partition %d at offset %d", con.topic, p, offset.Offset)
 
 					consumer, err := sarama_consumer.ConsumePartition(con.topic, p, offset.Offset)
 					if err != nil {
@@ -913,6 +943,7 @@ func (*RoundRobin) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string) {
 // for each topic in jresp, assign the topic's partitions round-robin across the members requesting the topic
 func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
 	by_member, err := jresp.GetMembers()
+	dbgf("by_member %v", by_member)
 	if err != nil {
 		return err
 	}
@@ -929,11 +960,13 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 			by_topic[topic] = append(by_topic[topic], member)
 		}
 	}
+	dbgf("by_topic %v", by_topic)
 
 	// finally, build our assignments of partitions to members
 	assignments := make(map[string]map[string][]int32) // map of member to topics, and topic to partitions
 	for topic, members := range by_topic {
 		partitions, err := client.Partitions(topic)
+		dbgf("Partitions(%q) = %v", topic, partitions)
 		if err != nil {
 			// what to do? we could maybe skip the topic, assigning it to no-one. But I/O errors are likely to happen again.
 			// so let's stop partitioning and return the error.
@@ -959,6 +992,7 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 			}
 		}
 	}
+	dbgf("assignments %v", assignments)
 
 	// and encode the assignments in the sync request
 	for member_id, topics := range assignments {
@@ -978,6 +1012,7 @@ func (*RoundRobin) ParseSync(sresp *sarama.SyncGroupResponse) (map[string][]int3
 		return nil, nil
 	}
 	ma, err := sresp.GetMemberAssignment()
+	dbgf("MemberAssignment %v", ma)
 	if err != nil {
 		return nil, err
 	}
