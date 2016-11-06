@@ -797,12 +797,13 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			}
 
 			// and deliver the msg (or handle any of the other messages which can arrive)
+		deliver_loop:
 			for {
 				select {
 				case con.messages <- msg:
 					dbgf("delivered msg %d/%d", msg.Partition, msg.Offset)
 					// success
-					break
+					break deliver_loop
 
 				case msg2 := <-con.done:
 					done(msg2)
