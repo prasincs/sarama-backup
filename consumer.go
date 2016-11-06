@@ -632,7 +632,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			} else {
 				for topic, partitions := range ocresp.Errors {
 					for partition, err := range partitions {
-						con.cl.deliverError(fmt.Sprintf("comitting offset if topic %q partition %d", topic, partition), err)
+						con.cl.deliverError(fmt.Sprintf("comitting offset of topic %q partition %d", topic, partition), err)
 					}
 				}
 			}
