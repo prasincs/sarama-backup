@@ -159,7 +159,8 @@ type Consumer interface {
 
 	// AsyncClose terminates the consumer cleanly. Callers should continue to read from
 	// Messages and Errors channels until they are closed. You must call AsyncClose before
-	// closing the underlying sarama.Client.
+	// closing the underlying sarama.Client. Calling AsyncClose multiple times is permitted.
+	// Only the first call has any effect.
 	AsyncClose()
 }
 
@@ -209,11 +210,16 @@ type add_consumer struct {
 
 func (cl *client) Consume(topic string) (Consumer, error) {
 	con := &consumer{
-		cl:          cl,
-		topic:       topic,
-		messages:    make(chan *sarama.ConsumerMessage),
-		errors:      make(chan error),
+		cl:    cl,
+		topic: topic,
+
+		messages: make(chan *sarama.ConsumerMessage),
+		errors:   make(chan error),
+
+		closed: make(chan struct{}),
+
 		assignments: make(chan *assignment, 1),
+
 		premessages: make(chan *sarama.ConsumerMessage),
 		done:        make(chan *sarama.ConsumerMessage), // TODO give ourselves some capacity once I know it runs right without any (capacity hides bugs :-)
 	}
