@@ -229,6 +229,7 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 		closed: make(chan struct{}),
 
 		assignments: make(chan *assignment, 1),
+		commit_reqs: make(chan commit_req),
 
 		premessages: make(chan *sarama.ConsumerMessage),
 		done:        make(chan *sarama.ConsumerMessage), // TODO give ourselves some capacity once I know it runs right without any (capacity hides bugs :-)
@@ -245,6 +246,7 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 
 func (cl *client) Close() {
 	// signal to cl.run() that it should exit
+	dbgf("Close client of consumer-group %q", cl.group_name)
 	close(cl.closed)
 }
 
@@ -253,6 +255,8 @@ func (cl *client) run(early_rc chan<- error) {
 	var member_id string                    // our group member id, assigned to us by kafka when we first make contact
 	consumers := make(map[string]*consumer) // map of topic -> consumer
 	var wg sync.WaitGroup                   // waitgroup used to wait for all consumers to exit
+
+	defer dbgf("consumer-group %q client exiting", cl.group_name)
 
 	// add a consumer
 	add := func(add add_consumer) {
@@ -278,6 +282,9 @@ func (cl *client) run(early_rc chan<- error) {
 		if existing_con == con {
 			delete(consumers, con.topic)
 		} // else it's some old consumer and we've already removed it
+		// and let the consumer shutdown
+		close(con.assignments)
+		close(con.commit_reqs)
 	}
 	// shutdown the consumers. waits until they are all stopped. only call once and return afterwards, since it makes assumptions that hold only when it is used like that
 	shutdown := func() {
@@ -285,13 +292,13 @@ func (cl *client) run(early_rc chan<- error) {
 		for _, con := range consumers {
 			con.AsyncClose()
 		}
-		// and consume any last rem_cosumer messages from them
+		// and consume any last rem_consumer messages from them
 		go func() {
 			wg.Wait()
 			close(cl.rem_consumer)
 		}()
-		for _ = range cl.rem_consumer {
-			// toss the message; we're shutting down
+		for con := range cl.rem_consumer {
+			rem(con)
 		}
 		// and shutdown the errors channel
 		close(cl.errors)
@@ -475,6 +482,8 @@ join_loop:
 
 		// start the heartbeat timer
 		heartbeat_timer := time.After(cl.config.Heartbeat.Interval)
+		// and the offset commit timer
+		commit_timer := time.After(cl.config.Offsets.Interval)
 
 		// and loop, sending heartbeats until something happens and we need to rejoin (or exit)
 	heartbeat_loop:
@@ -526,6 +535,41 @@ join_loop:
 				// that way when the network or the broker are slow we back off.
 				heartbeat_timer = time.After(cl.config.Heartbeat.Interval)
 
+			case <-commit_timer:
+				ocreq := &sarama.OffsetCommitRequest{
+					ConsumerGroup:           cl.group_name,
+					ConsumerGroupGeneration: generation_id,
+					ConsumerID:              member_id,
+					RetentionTime:           int64(cl.config.Offsets.RetentionTime / time.Millisecond),
+					Version:                 2, // kafka 0.9.0 version, with RetentionTime
+				}
+				if cl.config.Offsets.RetentionTime == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
+					ocreq.RetentionTime = -1 // use broker's value
+				}
+				var wg sync.WaitGroup
+				wg.Add(len(consumers))
+				for _, con := range consumers {
+					con.commit_reqs <- commit_req{ocreq, &wg}
+				}
+				wg.Wait()
+				dbgf("sending OffsetCommitRequest %v", ocreq)
+				ocresp, err := coor.CommitOffset(ocreq)
+				dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
+				// log any errors we got. there isn't much we can do about them
+				if err != nil {
+					cl.deliverError("comitting offsets", err)
+				} else {
+					for topic, partitions := range ocresp.Errors {
+						for partition, err := range partitions {
+							if err != 0 {
+								cl.deliverError(fmt.Sprintf("comitting offset of topic %q partition %d", topic, partition), err)
+							}
+						}
+					}
+				}
+
+				commit_timer = time.After(cl.config.Offsets.Interval)
+
 			case a := <-cl.add_consumer:
 				add(a)
 				// and rejoin so we can become a member of the new topic
@@ -572,10 +616,17 @@ type consumer struct {
 	closed     chan struct{} // channel which is closed when the consumer is AsyncClose()ed
 	close_once sync.Once     // Once used to make sure we close only once
 
-	assignments chan *assignment // channel over which the client.run sends consumer.run each generation's partition assignments
+	assignments chan *assignment // channel over which client.run sends consumer.run each generation's partition assignments
+	commit_reqs chan commit_req  // channel over which client.run sends consumer.run request to fill out a OffsetCommitRequest
 
 	premessages chan *sarama.ConsumerMessage // channel through which partition consumers deliver messages to the consumer
 	done        chan *sarama.ConsumerMessage // channel through which Done() returns messages
+}
+
+// commit_req is a request for a consumer to write its part into a OffsetCommitRequest
+type commit_req struct {
+	ocreq *sarama.OffsetCommitRequest
+	wg    *sync.WaitGroup
 }
 
 // assignment is this client's assigned partitions
@@ -591,12 +642,12 @@ func (con *consumer) Errors() <-chan error                     { return con.erro
 
 // close the consumer. it can safely be called multiple times
 func (con *consumer) AsyncClose() {
+	dbgf("AsyncClose consumer of topic %q", con.topic)
 	con.close_once.Do(func() { close(con.closed) })
 }
 
 // consumer goroutine
 func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
-
 	var generation_id int32 // current generation
 	var coor *sarama.Broker // current consumer group coordinating broker
 	var member_id string    // our member id assigned by coor
@@ -625,7 +676,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 					offset := partition.oldest
 					if len(partition.buckets) != 0 {
 						if partition.buckets[0][0] == partition.buckets[0][1] {
-							// add to that the portion of the last block we know been completed (this is often useful when a client shuts down cleanly, since it has probably cleanly returned all offsets we've delivered)
+							// add to that the portion of the last block we know been completed (this is often useful when the traffic rate is low or a client shuts down cleanly, since it has probably cleanly returned all offsets we've delivered)
 							offset += int64(partition.buckets[0][1])
 						} // else we don't know enough to commit any further
 					}
@@ -654,6 +705,23 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		}
 	}
 
+	// handle a commit request from client.run
+	commit_req := func(c commit_req) {
+		dbgf("consumer %q commit_req(%v)", con.topic, c)
+		for p, partition := range partitions {
+			offset := partition.oldest
+			if len(partition.buckets) != 0 {
+				if partition.buckets[0][0] == partition.buckets[0][1] {
+					// add to that the portion of the last block we know been completed (this is useful when the message rate is slow)
+					offset += int64(partition.buckets[0][1])
+				} // else we don't know enough to commit any further
+			}
+			dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
+			c.ocreq.AddBlock(con.topic, p, offset, 0, "")
+		}
+		c.wg.Done()
+	}
+
 	defer func() {
 		if len(partitions) != 0 {
 			// cleanup the remaining partition consumers
@@ -667,11 +735,33 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		sarama_consumer.Close()
 		close(con.messages)
 		close(con.errors)
-		con.cl.rem_consumer <- con
+
+		// send ourselves to rem_consumer
+	rem_loop:
+		for {
+			select {
+			case c := <-con.commit_reqs:
+				commit_req(c)
+			case <-con.assignments:
+				// ignore them
+			case con.cl.rem_consumer <- con:
+				break rem_loop
+			}
+		}
+
+		// drain any remaining requests from run.client
+		for c := range con.commit_reqs {
+			commit_req(c)
+		}
+		for range con.assignments {
+			// ignore them
+		}
+
+		dbgf("consumer of topic %q exiting", con.topic)
 		wg.Done()
 	}()
 
-	// handle a message over con.done
+	// handle a message sent to us via con.done
 	done := func(msg *sarama.ConsumerMessage) {
 		dbgf("consumer %q done(%d/%d)", con.topic, msg.Partition, msg.Offset)
 		partition := partitions[msg.Partition]
@@ -700,6 +790,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		}
 	}
 
+	// handle an assignment message
 	assignment := func(a *assignment) {
 		dbgf("consumer %q assignment(%v)", con.topic, a)
 		// see what has changed in the partition assignment of our topic
@@ -824,6 +915,8 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 					done(msg2)
 				case a := <-con.assignments:
 					assignment(a)
+				case c := <-con.commit_reqs:
+					commit_req(c)
 				case <-con.closed:
 					// the defered operations do the work
 					return
@@ -834,6 +927,8 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			done(msg)
 		case a := <-con.assignments:
 			assignment(a)
+		case c := <-con.commit_reqs:
+			commit_req(c)
 		case <-con.closed:
 			// the defered operations do the work
 			return
@@ -860,6 +955,7 @@ type partition struct {
 
 // run consumes from the partition and delivers it to the consumer
 func (partition *partition) run(con *consumer) {
+	defer dbgf("partition consumer of %q partition %d exiting", con.topic, partition.partition)
 	msgs := partition.consumer.Messages()
 	errors := partition.consumer.Errors()
 	for {
