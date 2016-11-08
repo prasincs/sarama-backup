@@ -46,8 +46,12 @@ type Config struct {
 	Offsets struct {
 		// The minimum interval between offset commits (defaults to 1s)
 		Interval time.Duration
-		// retention time of the committed offsets at the broker (defaults to 0 and the broker's value is used)
+		// retention time of the commited offsets at the broker (defaults to 0 and the broker's value is used)
 		RetentionTime time.Duration
+		// the handler for sarama.ErrOffsetOutOfRange errors (defaults to sarama.OffsetNewest,nil). Implementation
+		// must return the new starting offset in the partition, or an error. The sarama.Client is included for
+		// convenience, since handling this might involve querying the partition's current offsets.
+		OffsetOutOfRange func(topic string, partition int32, client sarama.Client) (offset int64, err error)
 	}
 	Session struct {
 		// The allowed session timeout for registered consumers (defaults to 30s).
@@ -69,11 +73,18 @@ type Config struct {
 	Partitioner Partitioner
 }
 
+// default implementation of Config.Offsets.OffsetOutOfRange jumps to the current head of the partition.
+func DefaultOffsetOutOfRange(topic string, partition int32, client sarama.Client) (offset int64, err error) {
+	offset = sarama.OffsetNewest
+	return
+}
+
 // NewConfig constructs a default configuration.
 func NewConfig() *Config {
 	cfg := &Config{}
 	cfg.Offsets.Interval = 1 * time.Second
 	cfg.Offsets.RetentionTime = 0 // use the server's default value
+	cfg.Offsets.OffsetOutOfRange = DefaultOffsetOutOfRange
 	cfg.Session.Timeout = 30 * time.Second
 	cfg.Rebalance.Timeout = 30 * time.Second
 	cfg.Heartbeat.Interval = 3 * time.Second
@@ -131,7 +142,7 @@ type Client interface {
 	// is closed.
 	Errors() <-chan error
 
-	// TODO have a Status() method for debug/logging?
+	// TODO have a Status() method for debug/logging? Or is Errors() enough?
 }
 
 /*
@@ -144,7 +155,7 @@ type Client interface {
 
   Every message read from the Messages channel must be eventually passed
   to Done. Calling Done is the signal that that message has been consumed
-  and the offset of that message can be comitted back to kafka.
+  and the offset of that message can be commited back to kafka.
 
   Of course this requires that the message's Partition and Offset fields not
   be altered.
@@ -157,7 +168,7 @@ type Consumer interface {
 	Messages() <-chan *sarama.ConsumerMessage
 
 	// Done indicates the processing of the message is complete, and its offset can
-	// be comitted to kafka. Calling Done twice with the same message, or with a
+	// be commited to kafka. Calling Done twice with the same message, or with a
 	// garbage message, can cause trouble.
 	Done(*sarama.ConsumerMessage)
 
@@ -175,7 +186,10 @@ type Consumer interface {
 }
 
 /*
-  Partitioner maps partitions to consumer group members
+  Partitioner maps partitions to consumer group members.
+
+  When the user wants control over the partitioning they should set
+  Config.Partitioner to their implementation of Partitioner.
 */
 type Partitioner interface {
 	// PrepareJoin prepares a JoinGroupRequest given the topics supplied.
@@ -187,7 +201,7 @@ type Partitioner interface {
 	// memberships from the JoinGroupResponse, it adds the results
 	// to the SyncGroupRequest. Returning an error cancels everything.
 	// The sarama.Client supplied to NewClient is included for convenince,
-	// since performing the partitioning probably requires looking at the
+	// since performing the partitioning probably requires looking at each
 	// topic's metadata, especially its list of partitions.
 	Partition(*sarama.SyncGroupRequest, *sarama.JoinGroupResponse, sarama.Client) error
 
@@ -219,9 +233,15 @@ type add_consumer struct {
 }
 
 func (cl *client) Consume(topic string) (Consumer, error) {
+	sarama_consumer, err := sarama.NewConsumerFromClient(cl.client)
+	if err != nil {
+		return nil, cl.makeError("Consume sarama.NewConsumerFromClient", err)
+	}
+
 	con := &consumer{
-		cl:    cl,
-		topic: topic,
+		cl:       cl,
+		consumer: sarama_consumer,
+		topic:    topic,
 
 		messages: make(chan *sarama.ConsumerMessage),
 		errors:   make(chan error),
@@ -231,14 +251,17 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 		assignments: make(chan *assignment, 1),
 		commit_reqs: make(chan commit_req),
 
-		premessages: make(chan *sarama.ConsumerMessage),
-		done:        make(chan *sarama.ConsumerMessage), // TODO give ourselves some capacity once I know it runs right without any (capacity hides bugs :-)
+		restart_partitions: make(chan *partition),
+		premessages:        make(chan *sarama.ConsumerMessage), // TODO give ourselves some capacity once I know it runs right without any (capacity hides bugs :-)
+		done:               make(chan *sarama.ConsumerMessage), // we should probably use sarama.Config.ChannelBufferSize for our channels
 	}
 
 	reply := make(chan error)
 	cl.add_consumer <- add_consumer{con, reply}
-	err := <-reply
+	err = <-reply
 	if err != nil {
+		// if an error is returned then it is up to us to close the sarama.Consumer
+		_ = sarama_consumer.Close() // we already have an error to return. a 2nd one is too much
 		return nil, err
 	}
 	return con, nil
@@ -266,14 +289,9 @@ func (cl *client) run(early_rc chan<- error) {
 			add.reply <- cl.makeError("Consume", fmt.Errorf("topic %q is already being consumed", add.con.topic))
 			return
 		}
-		sarama_consumer, err := sarama.NewConsumerFromClient(cl.client)
-		if err != nil {
-			add.reply <- cl.makeError("Consume sarama.NewConsumerFromClient", err)
-			return
-		}
 		consumers[add.con.topic] = add.con
 		wg.Add(1)
-		go add.con.run(sarama_consumer, &wg)
+		go add.con.run(&wg)
 		add.reply <- nil
 	}
 	// remove a consumer
@@ -557,12 +575,12 @@ join_loop:
 				dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
 				// log any errors we got. there isn't much we can do about them
 				if err != nil {
-					cl.deliverError("comitting offsets", err)
+					cl.deliverError("committing offsets", err)
 				} else {
 					for topic, partitions := range ocresp.Errors {
-						for partition, err := range partitions {
+						for p, err := range partitions {
 							if err != 0 {
-								cl.deliverError(fmt.Sprintf("comitting offset of topic %q partition %d", topic, partition), err)
+								cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), err)
 							}
 						}
 					}
@@ -607,8 +625,9 @@ func (cl *client) deliverError(context string, err error) {
 
 // consumer implements the Consumer interface
 type consumer struct {
-	cl    *client
-	topic string
+	cl       *client
+	consumer sarama.Consumer
+	topic    string
 
 	messages chan *sarama.ConsumerMessage
 	errors   chan error
@@ -619,8 +638,9 @@ type consumer struct {
 	assignments chan *assignment // channel over which client.run sends consumer.run each generation's partition assignments
 	commit_reqs chan commit_req  // channel over which client.run sends consumer.run request to fill out a OffsetCommitRequest
 
-	premessages chan *sarama.ConsumerMessage // channel through which partition consumers deliver messages to the consumer
-	done        chan *sarama.ConsumerMessage // channel through which Done() returns messages
+	restart_partitions chan *partition              // channel through which partition.run delivers partition restart [at new offset] requests
+	premessages        chan *sarama.ConsumerMessage // channel through which partition.run delivers messages to consumer.run
+	done               chan *sarama.ConsumerMessage // channel through which Done() returns messages
 }
 
 // commit_req is a request for a consumer to write its part into a OffsetCommitRequest
@@ -649,14 +669,14 @@ func (con *consumer) AsyncClose() {
 // consumer goroutine coordinates consuming from multiple partitions in a topic
 // NOTE WELL: this function must never do anything which would prevent it from processing message from client.run promptly.
 // That means any channel I/O must include cases for con.assignments and con.commit_reqs.
-func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
+func (con *consumer) run(wg *sync.WaitGroup) {
 	var generation_id int32 // current generation
 	var coor *sarama.Broker // current consumer group coordinating broker
 	var member_id string    // our member id assigned by coor
 
-	partitions := make(map[int32]*partition) // map of partition -> sarama consumer
+	partitions := make(map[int32]*partition) // map of partition number -> partition consumer
 
-	// shutdown the removed partitions, comitting their last offset
+	// shutdown the removed partitions, committing their last offset
 	remove := func(removed []int32) {
 		dbgf("consumer %q rem(%v)", con.topic, removed)
 		if len(removed) != 0 {
@@ -672,14 +692,14 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			}
 			for _, p := range removed {
 				// stop consuming from partition p
-				if partition, ok := partitions[p]; ok {
+				if part, ok := partitions[p]; ok {
 					delete(partitions, p)
-					partition.consumer.Close()
-					offset := partition.oldest
-					if len(partition.buckets) != 0 {
-						if partition.buckets[0][0] == partition.buckets[0][1] {
+					part.consumer.Close()
+					offset := part.oldest
+					if len(part.buckets) != 0 {
+						if part.buckets[0][0] == part.buckets[0][1] {
 							// add to that the portion of the last block we know been completed (this is often useful when the traffic rate is low or a client shuts down cleanly, since it has probably cleanly returned all offsets we've delivered)
-							offset += int64(partition.buckets[0][1])
+							offset += int64(part.buckets[0][1])
 						} // else we don't know enough to commit any further
 					}
 					dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
@@ -691,12 +711,12 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
 			// log any errors we got. there isn't much we can do about them; the next consumer will start at an older offset
 			if err != nil {
-				con.cl.deliverError("comitting offsets", err)
+				con.cl.deliverError("committing offsets", err)
 			} else {
 				for topic, partitions := range ocresp.Errors {
-					for partition, err := range partitions {
+					for p, err := range partitions {
 						if err != 0 {
-							con.cl.deliverError(fmt.Sprintf("comitting offset of topic %q partition %d", topic, partition), err)
+							con.cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), err)
 						}
 					}
 				}
@@ -734,7 +754,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			remove(removed)
 		}
 
-		sarama_consumer.Close()
+		con.consumer.Close()
 		close(con.messages)
 		close(con.errors)
 
@@ -770,28 +790,28 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 	// handle a message sent to us via con.done
 	done := func(msg *sarama.ConsumerMessage) {
 		dbgf("consumer %q done(%d/%d)", con.topic, msg.Partition, msg.Offset)
-		partition := partitions[msg.Partition]
-		if partition == nil {
+		part := partitions[msg.Partition]
+		if part == nil {
 			dbgf("no partition %d", msg.Partition)
 			return
 		}
-		delta := msg.Offset - partition.oldest
+		delta := msg.Offset - part.oldest
 		if delta < 0 {
 			dbgf("stale message %d/%d", msg.Partition, msg.Offset)
 			return
 		}
 		index := int(delta) >> 6 //  /64
-		if index >= len(partition.buckets) {
+		if index >= len(part.buckets) {
 			dbgf("early message %d/%d", msg.Partition, msg.Offset)
 			return
 		}
-		partition.buckets[index][1]++
+		part.buckets[index][1]++
 		if index == 0 {
 			// we might have finished the oldest bucket
-			for partition.buckets[0] == [2]uint8{64, 64} {
-				// the oldest bucket is complete; advance the last comitted offset
-				partition.oldest += 64
-				partition.buckets = partition.buckets[1:]
+			for part.buckets[0] == [2]uint8{64, 64} {
+				// the oldest bucket is complete; advance the last commited offset
+				part.oldest += 64
+				part.buckets = part.buckets[1:]
 			}
 		}
 	}
@@ -807,7 +827,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		// shutdown the partitions while in the previous generation
 		remove(removed)
 
-		// update the current generation and related info after comitting the last offsets from the previous generation
+		// update the current generation and related info after committing the last offsets from the previous generation
 		generation_id = a.generation_id
 		coor = a.coordinator
 		member_id = a.member_id
@@ -817,7 +837,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		// the old id. So unless the client lies and sends generation_id+1 when it commits there is nothing it can commit, and there
 		// is no point in waiting. So for now, no waiting.
 
-		// fetch the last comitted offsets of the new partitions
+		// fetch the last commited offsets of the new partitions
 		oreq := &sarama.OffsetFetchRequest{
 			ConsumerGroup: con.cl.group_name,
 			Version:       1, // kafka 0.9.0 expects version 1 offset requests
@@ -833,7 +853,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			con.cl.deliverError(fmt.Sprintf("fetching offsets for topic %q", con.topic), err)
 			// and we can't consume any of the new partitions without the offsets
 		} else if len(added) != 0 {
-			// start consuming from the added partitions at each partition's last committed offset (which by convention kafaka defines as the last consumed offset+1)
+			// start consuming from the added partitions at each partition's last commited offset (which by convention kafaka defines as the last consumed offset+1)
 			// since computing the starting offset and beginning to consume requires several round trips to the kafka brokers we start all the
 			// partitions concurrently. That reduces the startup time to a couple RTTs even for topics with a numerous partitions.
 			started := make(chan *partition)
@@ -855,21 +875,41 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 
 					dbgf("consumer %q consuming partition %d at offset %d", con.topic, p, offset.Offset)
 
-					consumer, err := sarama_consumer.ConsumePartition(con.topic, p, offset.Offset)
+					consumer, err := con.consumer.ConsumePartition(con.topic, p, offset.Offset)
 					if err != nil {
 						con.cl.deliverError(fmt.Sprintf("sarama.ConsumePartition(%q, %d, %d)", con.topic, p, offset.Offset), err)
-						// and we can't consume this one
-						return
+
+						// If the error is ErrOffsetOutOfRange then give ourselves one chance to recover
+						if err != sarama.ErrOffsetOutOfRange {
+							// otherwise we can't consume this partition.
+							return
+						}
+
+						offset, err := con.cl.config.Offsets.OffsetOutOfRange(con.topic, p, con.cl.client)
+						if err != nil {
+							// should we deliver them their own error? I guess so.
+							con.cl.deliverError(fmt.Sprintf("OffsetOutOfRange consuming topic %q partition %d", con.topic, p), err)
+							return
+						}
+
+						consumer, err = con.consumer.ConsumePartition(con.topic, p, offset)
+						if err != nil {
+							con.cl.deliverError(fmt.Sprintf("sarama.ConsumePartition(%q, %d, %d)", con.topic, p, offset), err)
+							// it didn't work with their offset either. give up
+							// (we could go into a loop and call them again, but what would that solve?)
+							return
+						}
+						// it worked with the new offset; carry on
 					}
 
-					partition := &partition{
+					part := &partition{
 						consumer:  consumer,
 						partition: p,
 						oldest:    offset.Offset,
 					}
-					go partition.run(con)
+					go part.run(con)
 
-					started <- partition
+					started <- part
 				}(p)
 			}
 			go func() {
@@ -877,10 +917,48 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 				close(started)
 			}()
 
-			for partition := range started {
-				partitions[partition.partition] = partition
+			for part := range started {
+				partitions[part.partition] = part
 			}
 		}
+	}
+
+	// restart consuming a partition at a new[er] offset
+	restart_partition := func(part *partition) {
+		// we kill the old and start a new partition consumer since there is no way to seek an existing sarama.PartitionConsumer in sarama's November 2016 API)
+		p := part.partition
+
+		// first remove the old partition consumer. Once it gets a ErrOffsetOutOfRange it's unable to function.
+		// since it had an out-of-range offset, it can't commit its offset either
+		if pa, ok := partitions[p]; !ok || part != pa {
+			// this is an unknown partition, or we've already killed it; ignore the request
+			return
+		}
+		delete(partitions, p)
+		part.consumer.Close()
+
+		// then ask what the new starting offset should be
+		offset, err := con.cl.config.Offsets.OffsetOutOfRange(con.topic, p, con.cl.client)
+		if err != nil {
+			// should we deliver them their own error? I guess so.
+			con.cl.deliverError(fmt.Sprintf("OffsetOutOfRange consuming topic %q partition %d", con.topic, p), err)
+			return
+		}
+
+		// finally make a new partition consuming starting at the given offset
+		consumer, err := con.consumer.ConsumePartition(con.topic, p, offset)
+		if err != nil {
+			con.cl.deliverError(fmt.Sprintf("sarama.ConsumePartition(%q, %d, %d)", con.topic, p, offset), err)
+			return
+		}
+
+		part = &partition{
+			consumer:  consumer,
+			partition: p,
+			oldest:    offset,
+		}
+		go part.run(con)
+		partitions[p] = part
 	}
 
 	for {
@@ -888,28 +966,28 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		case msg := <-con.premessages:
 			dbgf("premessage msg %d/%d", msg.Partition, msg.Offset)
 			// keep track of msg's offset so we can match it with Done, and deliver the msg
-			partition := partitions[msg.Partition]
-			if partition == nil {
+			part := partitions[msg.Partition]
+			if part == nil {
 				// message from a stale consumer; ignore it
 				dbgf("no partition %d", msg.Partition)
 				continue
 			}
-			if partition.oldest == sarama.OffsetNewest || partition.oldest == sarama.OffsetOldest {
+			if part.oldest == sarama.OffsetNewest || part.oldest == sarama.OffsetOldest {
 				// we now know the starting offset. make as if we'd been asked to start there
-				partition.oldest = msg.Offset
+				part.oldest = msg.Offset
 			}
-			delta := msg.Offset - partition.oldest
+			delta := msg.Offset - part.oldest
 			if delta < 0 { // || delta > max-out-of-order  (TODO)
 				dbgf("stale message %d/%d", msg.Partition, msg.Offset)
 				// we can't take this message into account
 				continue
 			}
 			index := int(delta) >> 6 //  /64
-			for index >= len(partition.buckets) {
+			for index >= len(part.buckets) {
 				// add a new bucket
-				partition.buckets = append(partition.buckets, [2]uint8{0, 0})
+				part.buckets = append(part.buckets, [2]uint8{0, 0})
 			}
-			partition.buckets[index][0]++
+			part.buckets[index][0]++
 
 			// and deliver the msg (or handle any of the other messages which can arrive)
 		deliver_loop:
@@ -926,6 +1004,8 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 					assignment(a)
 				case c := <-con.commit_reqs:
 					commit_req(c)
+				case p := <-con.restart_partitions:
+					restart_partition(p)
 				case <-con.closed:
 					// the defered operations do the work
 					return
@@ -938,6 +1018,8 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			assignment(a)
 		case c := <-con.commit_reqs:
 			commit_req(c)
+		case p := <-con.restart_partitions:
+			restart_partition(p)
 		case <-con.closed:
 			// the defered operations do the work
 			return
@@ -962,16 +1044,16 @@ type partition struct {
 	partition int32 // partition number
 	// buckets of # of offsets read from kafka, and the # of offsets completed by a call to Done(). the difference is the # of offsets in flight in the calling code
 	// we group offsets in groups of 64 and simply keep a count of how many are outstanding
-	// any time the two counts are equal then the offsets are comittable. Otherwise we can't tell which is the not yet Done() offset and so we don't know
+	// any time the two counts are equal then the offsets are committable. Otherwise we can't tell which is the not yet Done() offset and so we don't know
 	buckets [][2]uint8
 	oldest  int64 // 1st offset in bucket[0]
 }
 
 // run consumes from the partition and delivers it to the consumer
-func (partition *partition) run(con *consumer) {
-	defer dbgf("partition consumer of %q partition %d exiting", con.topic, partition.partition)
-	msgs := partition.consumer.Messages()
-	errors := partition.consumer.Errors()
+func (part *partition) run(con *consumer) {
+	defer dbgf("partition consumer of %q partition %d exiting", con.topic, part.partition)
+	msgs := part.consumer.Messages()
+	errors := part.consumer.Errors()
 	for {
 		select {
 		case msg, ok := <-msgs:
@@ -983,7 +1065,7 @@ func (partition *partition) run(con *consumer) {
 					return
 				}
 			} else {
-				dbgf("draining topic %q partition %d errors", con.topic, partition.partition)
+				dbgf("draining topic %q partition %d errors", con.topic, part.partition)
 				// finish off any remaining errors, and exit
 				for sarama_err := range errors {
 					err := con.makeConsumerError(sarama_err)
@@ -997,8 +1079,21 @@ func (partition *partition) run(con *consumer) {
 			}
 		case sarama_err, ok := <-errors:
 			if ok {
-				// TODO handle "you asked for a too old a message" by jumping ahead? make that configurable, but typically that's all you can do anyway
 				err := con.makeConsumerError(sarama_err)
+				// pick out ErrOffsetOutOfRange errors. These happen if the consumer offset falls off the tail of the kafka log.
+				// this easily happens in two cases: when the consumer is too slow, or when the consumer has been stopped for too long.
+				// This error cannot be fixed without seeking to a valid offset. However we can't assume that OffsetNewest is the right
+				// choice, nor OffsetOldest, nor "5 minutes ago" or anything else. It's up to the user to decide.
+				if sarama_err.Err == sarama.ErrOffsetOutOfRange {
+					dbgf("ErrOffsetOutOfRange topic %q partition %d", con.topic, part.partition)
+					select {
+					case con.restart_partitions <- part:
+					case <-con.closed:
+						return
+					}
+					// should we keep reading from the partition? it's unlikely to produce much
+				}
+				// and always deliver the error
 				select {
 				case con.errors <- err:
 				case <-con.closed:
@@ -1006,7 +1101,7 @@ func (partition *partition) run(con *consumer) {
 				}
 			} else {
 				// finish off any remaining messages, and exit
-				dbgf("draining topic %q partition %d msgs", con.topic, partition.partition)
+				dbgf("draining topic %q partition %d msgs", con.topic, part.partition)
 				for msg := range msgs {
 					select {
 					case con.premessages <- msg:
