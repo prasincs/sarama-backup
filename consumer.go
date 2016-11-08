@@ -88,7 +88,7 @@ func NewConfig() *Config {
 	cfg.Session.Timeout = 30 * time.Second
 	cfg.Rebalance.Timeout = 30 * time.Second
 	cfg.Heartbeat.Interval = 3 * time.Second
-	cfg.Partitioner = (*RoundRobin)(nil) // the infamous non-nil interface
+	cfg.Partitioner = RoundRobin
 	return cfg
 }
 
@@ -1160,19 +1160,22 @@ func (p int32Slice) Len() int           { return len(p) }
 func (p int32Slice) Less(i, j int) bool { return p[i] < p[j] }
 func (p int32Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 
-// a simple partitioner that assigns partitions round-robin across all consumers requesting the topic
-type RoundRobin struct{}
+// a simple partitioner that assigns partitions round-robin across all consumers requesting each topic
+type roundRobinPartitioner string
 
-func (*RoundRobin) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string) {
-	jreq.AddGroupProtocolMetadata("round-robin",
+// global instance of the round-robin partitioner
+const RoundRobin roundRobinPartitioner = "roundrobin" // use the string "roundrobin" without a dash to match what kafka java code uses, should someone want to mix go and java consumers in the same group
+
+func (rr roundRobinPartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string) {
+	jreq.AddGroupProtocolMetadata(string(rr),
 		&sarama.ConsumerGroupMemberMetadata{
 			Version: 1,
 			Topics:  topics,
 		})
 }
 
-// for each topic in jresp, assign the topic's partitions round-robin across the members requesting the topic
-func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
+// for each topic in jresp, assign the topic's partitions round-robin across the members requesting each topic
+func (roundRobinPartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
 	by_member, err := jresp.GetMembers()
 	dbgf("by_member %v", by_member)
 	if err != nil {
@@ -1238,7 +1241,7 @@ func (*RoundRobin) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGr
 	return nil
 }
 
-func (*RoundRobin) ParseSync(sresp *sarama.SyncGroupResponse) (map[string][]int32, error) {
+func (roundRobinPartitioner) ParseSync(sresp *sarama.SyncGroupResponse) (map[string][]int32, error) {
 	if len(sresp.MemberAssignment) == 0 {
 		// in the corner case that we ask for no topics, we get nothing back. However sarama fd498173ae2bf (head of master branch Nov 6th 2016) will return a useless error if we call sresp.GetMemberAssignment() in this case
 		return nil, nil
