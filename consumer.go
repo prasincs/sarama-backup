@@ -40,19 +40,12 @@ func (err Error) Error() string {
 }
 
 // Config is the configuration of a Client. Typically you'd create a default configuration with
-// NewConfig, modofy any fields of interest, and pass it to NewClient. Once passed to NewClient the
-// Config must not be modified. (doing so leads to data races, and may caused bugs as well)
+// NewConfig, modify any fields of interest, and pass it to NewClient. Once passed to NewClient the
+// Config must not be modified. (doing so leads to data races, and may caused bugs as well).
+//
+// In addition to this config, consumer's code also looks at the sarama.Config of the sarama.Client
+// supplied to NewClient, especially at the Consumer.Offset settings, Version, and [TODO] ChannelBufferSize.
 type Config struct {
-	Offsets struct {
-		// The minimum interval between offset commits (defaults to 1s)
-		Interval time.Duration
-		// retention time of the commited offsets at the broker (defaults to 0 and the broker's value is used)
-		RetentionTime time.Duration
-		// the handler for sarama.ErrOffsetOutOfRange errors (defaults to sarama.OffsetNewest,nil). Implementation
-		// must return the new starting offset in the partition, or an error. The sarama.Client is included for
-		// convenience, since handling this might involve querying the partition's current offsets.
-		OffsetOutOfRange func(topic string, partition int32, client sarama.Client) (offset int64, err error)
-	}
 	Session struct {
 		// The allowed session timeout for registered consumers (defaults to 30s).
 		// Must be within the allowed server range.
@@ -69,8 +62,14 @@ type Config struct {
 		// than 1/3rd of the Group.Session.Timout setting
 		Interval time.Duration
 	}
+
 	// the partitioner used to map partitions to consumer group members (defaults to a round-robin partitioner)
 	Partitioner Partitioner
+
+	// The handler for sarama.ErrOffsetOutOfRange errors (defaults to sarama.OffsetNewest,nil). Implementation
+	// must return the new starting offset in the partition, or an error. The sarama.Client is included for
+	// convenience, since handling this might involve querying the partition's current offsets.
+	OffsetOutOfRange func(topic string, partition int32, client sarama.Client) (offset int64, err error)
 }
 
 // default implementation of Config.Offsets.OffsetOutOfRange jumps to the current head of the partition.
@@ -82,13 +81,11 @@ func DefaultOffsetOutOfRange(topic string, partition int32, client sarama.Client
 // NewConfig constructs a default configuration.
 func NewConfig() *Config {
 	cfg := &Config{}
-	cfg.Offsets.Interval = 1 * time.Second
-	cfg.Offsets.RetentionTime = 0 // use the server's default value
-	cfg.Offsets.OffsetOutOfRange = DefaultOffsetOutOfRange
 	cfg.Session.Timeout = 30 * time.Second
 	cfg.Rebalance.Timeout = 30 * time.Second
 	cfg.Heartbeat.Interval = 3 * time.Second
 	cfg.Partitioner = RoundRobin
+	cfg.OffsetOutOfRange = DefaultOffsetOutOfRange
 	return cfg
 }
 
@@ -102,6 +99,12 @@ func NewConfig() *Config {
   The consumer group name is used to match this client with other
   instances running elsewhere, but connected to the same cluster
   of kafka brokers and using the same consumer group name.
+
+  The supplied sarama.Client should have been constructed with a sarama.Config
+  where sarama.Config.Version is >= consumer.MinVersion, and if full handling of
+  ErrOffsetOutOfRange is desired, sarama.Config.Consumer.Return.Errors = true.
+
+  In addition, this package uses the settings in sarama.Config.Consumer.Offset
 */
 func NewClient(group_name string, config *Config, sarama_client sarama.Client) (Client, error) {
 
@@ -125,7 +128,7 @@ func NewClient(group_name string, config *Config, sarama_client sarama.Client) (
 }
 
 /*
-  Client is a kafaka client belonging to a consumer group.
+  Client is a kafaka client belonging to a consumer group. It is created by NewClient.
 */
 type Client interface {
 	// Consume returns a consumer of the given topic
@@ -501,7 +504,8 @@ join_loop:
 		// start the heartbeat timer
 		heartbeat_timer := time.After(cl.config.Heartbeat.Interval)
 		// and the offset commit timer
-		commit_timer := time.After(cl.config.Offsets.Interval)
+		clconfig := cl.client.Config()
+		commit_timer := time.After(clconfig.Consumer.Offsets.CommitInterval)
 
 		// and loop, sending heartbeats until something happens and we need to rejoin (or exit)
 	heartbeat_loop:
@@ -558,10 +562,10 @@ join_loop:
 					ConsumerGroup:           cl.group_name,
 					ConsumerGroupGeneration: generation_id,
 					ConsumerID:              member_id,
-					RetentionTime:           int64(cl.config.Offsets.RetentionTime / time.Millisecond),
+					RetentionTime:           int64(clconfig.Consumer.Offsets.Retention / time.Millisecond),
 					Version:                 2, // kafka 0.9.0 version, with RetentionTime
 				}
-				if cl.config.Offsets.RetentionTime == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
+				if clconfig.Consumer.Offsets.Retention == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
 					ocreq.RetentionTime = -1 // use broker's value
 				}
 				var wg sync.WaitGroup
@@ -586,7 +590,7 @@ join_loop:
 					}
 				}
 
-				commit_timer = time.After(cl.config.Offsets.Interval)
+				commit_timer = time.After(clconfig.Consumer.Offsets.CommitInterval)
 
 			case a := <-cl.add_consumer:
 				add(a)
@@ -679,15 +683,16 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 	// shutdown the removed partitions, committing their last offset
 	remove := func(removed []int32) {
 		dbgf("consumer %q rem(%v)", con.topic, removed)
+		clconfig := con.cl.client.Config()
 		if len(removed) != 0 {
 			ocreq := &sarama.OffsetCommitRequest{
 				ConsumerGroup:           con.cl.group_name,
 				ConsumerGroupGeneration: generation_id,
 				ConsumerID:              member_id,
-				RetentionTime:           int64(con.cl.config.Offsets.RetentionTime / time.Millisecond),
+				RetentionTime:           int64(clconfig.Consumer.Offsets.Retention / time.Millisecond),
 				Version:                 2, // kafka 0.9.0 version, with RetentionTime
 			}
-			if con.cl.config.Offsets.RetentionTime == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
+			if clconfig.Consumer.Offsets.Retention == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
 				ocreq.RetentionTime = -1 // use broker's value
 			}
 			for _, p := range removed {
@@ -862,22 +867,28 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 				wg.Add(1)
 				go func(p int32) {
 					defer wg.Done()
-					offset := oresp.GetBlock(con.topic, p)
-					if offset == nil {
+					ob := oresp.GetBlock(con.topic, p)
+					if ob == nil {
 						// can't start this partition without an offset
 						con.cl.deliverError("FetchOffset response", fmt.Errorf("topic %q partition %d missing", con.topic, p))
 						return
 					}
-					if offset.Err != 0 {
-						con.cl.deliverError(fmt.Sprintf("FetchOffset error for topic %q partition %d", con.topic, p), offset.Err)
+					if ob.Err != 0 {
+						con.cl.deliverError(fmt.Sprintf("FetchOffset error for topic %q partition %d", con.topic, p), ob.Err)
 						return
 					}
 
-					dbgf("consumer %q consuming partition %d at offset %d", con.topic, p, offset.Offset)
+					offset := ob.Offset
+					if offset == sarama.OffsetNewest {
+						// the broker doesn't have an offset for is. Use the configured initial offset
+						offset = con.cl.client.Config().Consumer.Offsets.Initial
+					}
 
-					consumer, err := con.consumer.ConsumePartition(con.topic, p, offset.Offset)
+					dbgf("consumer %q consuming partition %d at offset %d", con.topic, p, offset)
+
+					consumer, err := con.consumer.ConsumePartition(con.topic, p, offset)
 					if err != nil {
-						con.cl.deliverError(fmt.Sprintf("sarama.ConsumePartition(%q, %d, %d)", con.topic, p, offset.Offset), err)
+						con.cl.deliverError(fmt.Sprintf("sarama.ConsumePartition(%q, %d, %d)", con.topic, p, offset), err)
 
 						// If the error is ErrOffsetOutOfRange then give ourselves one chance to recover
 						if err != sarama.ErrOffsetOutOfRange {
@@ -885,7 +896,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 							return
 						}
 
-						offset, err := con.cl.config.Offsets.OffsetOutOfRange(con.topic, p, con.cl.client)
+						offset, err = con.cl.config.OffsetOutOfRange(con.topic, p, con.cl.client)
 						if err != nil {
 							// should we deliver them their own error? I guess so.
 							con.cl.deliverError(fmt.Sprintf("OffsetOutOfRange consuming topic %q partition %d", con.topic, p), err)
@@ -905,7 +916,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 					part := &partition{
 						consumer:  consumer,
 						partition: p,
-						oldest:    offset.Offset,
+						oldest:    offset,
 					}
 					go part.run(con)
 
@@ -938,7 +949,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		part.consumer.Close()
 
 		// then ask what the new starting offset should be
-		offset, err := con.cl.config.Offsets.OffsetOutOfRange(con.topic, p, con.cl.client)
+		offset, err := con.cl.config.OffsetOutOfRange(con.topic, p, con.cl.client)
 		if err != nil {
 			// should we deliver them their own error? I guess so.
 			con.cl.deliverError(fmt.Sprintf("OffsetOutOfRange consuming topic %q partition %d", con.topic, p), err)
