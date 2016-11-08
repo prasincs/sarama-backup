@@ -807,6 +807,9 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		member_id = a.member_id
 
 		// TODO the sarama-cluster code pauses here so that other consumers have time to sync their offsets. Should we do the same?
+		// I've observed with kafka 0.9.0.1 that once the coordinator bumps the generation_id the client can't commit an offset with
+		// the old id. So unless the client lies and sends generation_id+1 when it commits there is nothing it can commit, and there
+		// is no point in waiting. So for now, no waiting.
 
 		// fetch the last comitted offsets of the new partitions
 		oreq := &sarama.OffsetFetchRequest{
