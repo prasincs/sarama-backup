@@ -646,7 +646,9 @@ func (con *consumer) AsyncClose() {
 	con.close_once.Do(func() { close(con.closed) })
 }
 
-// consumer goroutine
+// consumer goroutine coordinates consuming from multiple partitions in a topic
+// NOTE WELL: this function must never do anything which would prevent it from processing message from client.run promptly.
+// That means any channel I/O must include cases for con.assignments and con.commit_reqs.
 func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 	var generation_id int32 // current generation
 	var coor *sarama.Broker // current consumer group coordinating broker
@@ -743,13 +745,17 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 			case c := <-con.commit_reqs:
 				commit_req(c)
 			case <-con.assignments:
-				// ignore them
+				// ignore them, we're shutting down
 			case con.cl.rem_consumer <- con:
 				break rem_loop
 			}
+			// NOTE: <-con.done is not a case above because there is no good way to shut it down. it is never closed,
+			// so we'd never know when it was drained. As a consequence, it's client.Done() which aborts when the
+			// consumer closes, rather than us draining con.done
 		}
 
-		// drain any remaining requests from run.client
+		// drain any remaining requests from run.client, until
+		// run.client closes the channels
 		for c := range con.commit_reqs {
 			commit_req(c)
 		}
@@ -806,7 +812,7 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 		coor = a.coordinator
 		member_id = a.member_id
 
-		// TODO the sarama-cluster code pauses here so that other consumers have time to sync their offsets. Should we do the same?
+		// the sarama-cluster code pauses here so that other consumers have time to sync their offsets. Should we do the same?
 		// I've observed with kafka 0.9.0.1 that once the coordinator bumps the generation_id the client can't commit an offset with
 		// the old id. So unless the client lies and sends generation_id+1 when it commits there is nothing it can commit, and there
 		// is no point in waiting. So for now, no waiting.
@@ -942,7 +948,12 @@ func (con *consumer) run(sarama_consumer sarama.Consumer, wg *sync.WaitGroup) {
 func (con *consumer) Done(msg *sarama.ConsumerMessage) {
 	// send it back to consumer.run to be processed synchronously
 	dbgf("Done(%d/%d)", msg.Partition, msg.Offset)
-	con.done <- msg
+	select {
+	case con.done <- msg:
+		// great, msg delivered
+	case <-con.closed:
+		// consumer has closed
+	}
 }
 
 // partition contains the data associated with us consuming one partition
