@@ -131,6 +131,7 @@ func NewClient(group_name string, config *Config, sarama_client sarama.Client) (
 
 	// start the client's manager goroutine
 	rc := make(chan error)
+	cl.wg.Add(1)
 	go cl.run(rc)
 
 	return cl, <-rc
@@ -144,8 +145,10 @@ type Client interface {
 	Consume(topic string) (Consumer, error)
 
 	// Close closes the client. It must be called to shutdown
-	// the client after AsyncClose is complete in consumers.
+	// the client. It calls AsyncClose on any yet unclosed topic
+	// Consumers created by this Client.
 	// It does NOT close the inner sarama.Client.
+	// Calling twice is NOT supported.
 	Close()
 
 	// Errors returns a channel which can (should) be monitored
@@ -186,6 +189,7 @@ type Consumer interface {
 	// Messages channel until it is closed, or not, as they wish.
 	// Calling Client.Close() performs a AsyncClose() on any remaining consumers.
 	// Calling AsyncClose multiple times is permitted. Only the first call has any effect.
+	// Never calling AsyncClose is also permitted. Client.Close() implies Consumer.AsyncClose.
 	AsyncClose()
 }
 
@@ -223,7 +227,9 @@ type client struct {
 
 	errors chan error // channel over which asynchronous errors are reported
 
-	closed       chan struct{}     // channel which is closed when the client is Close()ed
+	closed chan struct{}  // channel which is closed to cause the client to shutdown
+	wg     sync.WaitGroup // waitgroup which is done when the client is shutdown
+
 	add_consumer chan add_consumer // command channel used to add a new consumer
 	rem_consumer chan *consumer    // command channel used to remove an existing consumer
 }
@@ -271,14 +277,19 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 	return con, nil
 }
 
+// Close shutsdown the client and any remaining Consumers.
 func (cl *client) Close() {
 	// signal to cl.run() that it should exit
 	dbgf("Close client of consumer-group %q", cl.group_name)
 	close(cl.closed)
+	// and wait for the shutdown to be complete
+	cl.wg.Wait()
 }
 
-// long lived goroutine which manages this client's membership in the consumer group
+// run is a long lived goroutine which manages this client's membership in the consumer group.
 func (cl *client) run(early_rc chan<- error) {
+	defer cl.wg.Done()
+
 	var member_id string                    // our group member id, assigned to us by kafka when we first make contact
 	consumers := make(map[string]*consumer) // map of topic -> consumer
 	var wg sync.WaitGroup                   // waitgroup used to wait for all consumers to exit
@@ -287,6 +298,7 @@ func (cl *client) run(early_rc chan<- error) {
 
 	// add a consumer
 	add := func(add add_consumer) {
+		dbgf("client.run add(topic %q)", add.con.topic)
 		if _, ok := consumers[add.con.topic]; ok {
 			// topic already is being consumed. the way the standard kafka 0.9 group coordination works you cannot consume twice with the
 			// same client. If you want to consume the same topic twice, use two Clients.
@@ -300,6 +312,7 @@ func (cl *client) run(early_rc chan<- error) {
 	}
 	// remove a consumer
 	rem := func(con *consumer) {
+		dbgf("client.run rem(topic %q)", con.topic)
 		existing_con := consumers[con.topic]
 		if existing_con == con {
 			delete(consumers, con.topic)
@@ -310,6 +323,7 @@ func (cl *client) run(early_rc chan<- error) {
 	}
 	// shutdown the consumers. waits until they are all stopped. only call once and return afterwards, since it makes assumptions that hold only when it is used like that
 	shutdown := func() {
+		dbgf("client.run shutdown")
 		// shutdown the remaining consumers
 		for _, con := range consumers {
 			con.AsyncClose()
@@ -514,6 +528,11 @@ join_loop:
 			select {
 			case <-cl.closed:
 				// cl.Close() has been called; time to exit
+
+				// shutdown any remaining consumers (causing them to sync their final offsets)
+				shutdown()
+
+				// and nicely leave the consumer group
 				req := &sarama.LeaveGroupRequest{
 					GroupId:  cl.group_name,
 					MemberId: member_id,
@@ -527,9 +546,6 @@ join_loop:
 				if err != nil {
 					cl.deliverError("leaving group", err)
 				}
-
-				// shutdown the remaining consumers
-				shutdown()
 
 				// and we're done
 				return
@@ -695,52 +711,51 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 	// shutdown the removed partitions, committing their last offset
 	remove := func(removed []int32) {
 		dbgf("consumer %q rem(%v)", con.topic, removed)
+		if len(removed) == 0 {
+			// nothing to do, and no point in sending an empty OffsetCommitRequest msg either
+			return
+		}
 		clconfig := con.cl.client.Config()
-		if len(removed) != 0 {
-			ocreq := &sarama.OffsetCommitRequest{
-				ConsumerGroup:           con.cl.group_name,
-				ConsumerGroupGeneration: generation_id,
-				ConsumerID:              member_id,
-				RetentionTime:           int64(clconfig.Consumer.Offsets.Retention / time.Millisecond),
-				Version:                 2, // kafka 0.9.0 version, with RetentionTime
-			}
-			if clconfig.Consumer.Offsets.Retention == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
-				ocreq.RetentionTime = -1 // use broker's value
-			}
-			for _, p := range removed {
-				// stop consuming from partition p
-				if part, ok := partitions[p]; ok {
-					delete(partitions, p)
-					part.consumer.Close()
-					offset := part.oldest
-					if len(part.buckets) != 0 {
-						if part.buckets[0][0] == part.buckets[0][1] {
-							// add to that the portion of the last block we know been completed (this is often useful when the traffic rate is low or a client shuts down cleanly, since it has probably cleanly returned all offsets we've delivered)
-							offset += int64(part.buckets[0][1])
-						} // else we don't know enough to commit any further
-					}
-					dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
-					ocreq.AddBlock(con.topic, p, offset, 0, "")
+		ocreq := &sarama.OffsetCommitRequest{
+			ConsumerGroup:           con.cl.group_name,
+			ConsumerGroupGeneration: generation_id,
+			ConsumerID:              member_id,
+			RetentionTime:           int64(clconfig.Consumer.Offsets.Retention / time.Millisecond),
+			Version:                 2, // kafka 0.9.0 version, with RetentionTime
+		}
+		if clconfig.Consumer.Offsets.Retention == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
+			ocreq.RetentionTime = -1 // use broker's value
+		}
+		for _, p := range removed {
+			// stop consuming from partition p
+			if part, ok := partitions[p]; ok {
+				delete(partitions, p)
+				part.consumer.Close()
+				offset := part.oldest
+				if len(part.buckets) != 0 {
+					if part.buckets[0][0] == part.buckets[0][1] {
+						// add to that the portion of the last block we know been completed (this is often useful when the traffic rate is low or a client shuts down cleanly, since it has probably cleanly returned all offsets we've delivered)
+						offset += int64(part.buckets[0][1])
+					} // else we don't know enough to commit any further
 				}
-			}
-			dbgf("sending OffsetCommitRequest %v", ocreq)
-			ocresp, err := coor.CommitOffset(ocreq)
-			dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
-			// log any errors we got. there isn't much we can do about them; the next consumer will start at an older offset
-			if err != nil {
-				con.deliverError("committing offsets", -1, err)
-			} else {
-				for _, partitions := range ocresp.Errors {
-					for p, err := range partitions {
-						if err != 0 {
-							con.deliverError("committing offset", p, err)
-						}
-					}
-				}
+				dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
+				ocreq.AddBlock(con.topic, p, offset, 0, "")
 			}
 		}
-		if len(removed) == 0 {
-			return
+		dbgf("sending OffsetCommitRequest %v", ocreq)
+		ocresp, err := coor.CommitOffset(ocreq)
+		dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
+		// log any errors we got. there isn't much we can do about them; the next consumer will start at an older offset
+		if err != nil {
+			con.deliverError("committing offsets", -1, err)
+		} else {
+			for _, partitions := range ocresp.Errors {
+				for p, err := range partitions {
+					if err != 0 {
+						con.deliverError("committing offset", p, err)
+					}
+				}
+			}
 		}
 	}
 

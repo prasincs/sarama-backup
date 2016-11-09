@@ -26,7 +26,7 @@ the same key in either topic should arrive at the same consumer).
 PHILOSOPHY
 
 The consumer API has three rules: messages must be passed to Consumer.Done() once each message does
-not need to be replayed, Client.Errors() must be consumed, and Client.Close or Consumer.AsyncClose() must
+not need to be replayed, Client.Errors() must be consumed, and Client.Close() or Consumer.AsyncClose() must
 be called to clean up resources if your code wishes to stop consuming messages.
 
 Kafka's rule that [if consumers keep up] all messages will be seen at least once, and possibly
