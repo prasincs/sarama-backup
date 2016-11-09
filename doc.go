@@ -26,16 +26,17 @@ the same key in either topic should arrive at the same consumer).
 PHILOSOPHY
 
 The consumer API has three rules: messages must be passed to Consumer.Done() once each message does
-not need to be replayed, Consumer.Errors() must be consumed, and Close or AsyncClose() must
+not need to be replayed, Client.Errors() must be consumed, and Client.Close or Consumer.AsyncClose() must
 be called to clean up resources if your code wishes to stop consuming messages.
+
 Kafka's rule that [if consumers keep up] all messages will be seen at least once, and possibly
 many times always applies.
 
 The API of this package deliberately does not wrap or otherwise hide the underlying sarama API.
 I believe doing so is a waste of CPU time, generates more work for the gc, and makes building on top of
 a package harder than it should be. It also makes no assumptions about how the caller's work should be done.
-There are no requirements to process messages in order, nor does it impose any go-routine organization
-on the caller.
+There are no requirements to process messages in order, nor does it dictate a go-routine organization
+on the caller. I've applied RFC1925 #5 and #12 as best I can.
 
 I've used other kafka APIs which did wrap and impose structure and found them difficult to really use,
 and as a reaction I try not to impose such APIs on others (nor on myself) even if it means the calling

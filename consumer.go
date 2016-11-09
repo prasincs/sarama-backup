@@ -122,7 +122,7 @@ func NewClient(group_name string, config *Config, sarama_client sarama.Client) (
 		config:     config,
 		group_name: group_name,
 
-		errors: make(chan error, 10), // don't buffer more than a handful of asynchronous errors
+		errors: make(chan error),
 
 		closed:       make(chan struct{}),
 		add_consumer: make(chan add_consumer),
@@ -161,16 +161,14 @@ type Client interface {
   Consumer is a consumer of a topic.
 
   Messages from any partition assigned to this client arrive on the
-  Messages channel, and errors arrive on the Errors channel. These operate
-  the same as Messages and Errors in sarama.PartitionConsumer, except
-  that messages and errors from any partition are mixed together.
+  channel returned by Messages.
 
   Every message read from the Messages channel must be eventually passed
   to Done. Calling Done is the signal that that message has been consumed
   and the offset of that message can be committed back to kafka.
 
   Of course this requires that the message's Partition and Offset fields not
-  be altered.
+  be altered. Then again for what possible reason would you do such a thing?
 */
 type Consumer interface {
 	// Messages returns the channel of messages arriving from kafka. It always
@@ -183,14 +181,6 @@ type Consumer interface {
 	// be committed to kafka. Calling Done twice with the same message, or with a
 	// garbage message, can cause trouble.
 	Done(*sarama.ConsumerMessage)
-
-	// Errors returns the channel of errors. These include errors from the underlying
-	// partitions, as well as offset commit errors. Errors must be consumed only if
-	// the
-	//Note that sarama's Config.Consumer.Return.Errors
-	// is false by default, and without that most errors that occur within sarama are logged rather
-	// than returned.
-	Errors() <-chan error
 
 	// AsyncClose terminates the consumer cleanly. Callers can continue to read from
 	// Messages channel until it is closed, or not, as they wish.
@@ -238,6 +228,7 @@ type client struct {
 	rem_consumer chan *consumer    // command channel used to remove an existing consumer
 }
 
+// Errors returns the channel over which asynchronous errors are observed.
 func (cl *client) Errors() <-chan error { return cl.errors }
 
 // add_consumer are the messages sent over the client.add_consumer channel
@@ -258,7 +249,6 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 		topic:    topic,
 
 		messages: make(chan *sarama.ConsumerMessage),
-		errors:   make(chan error),
 
 		closed: make(chan struct{}),
 
@@ -627,17 +617,13 @@ func (cl *client) makeError(context string, err error) *Error {
 	}
 }
 
-// deliverError builds an error and delivers it asynchronously to the channel returned by cl.Errors
+// deliverError builds an error and delivers it to the channel returned by cl.Errors
 func (cl *client) deliverError(context string, err error) {
 	if context != "" {
 		err = cl.makeError(context, err)
 	}
 	dbgf("%v", err)
-	// deliver the error if anyone is listening. otherwise drop it
-	select {
-	case cl.errors <- err:
-	default:
-	}
+	cl.errors <- err
 }
 
 // consumer implements the Consumer interface
@@ -647,7 +633,6 @@ type consumer struct {
 	topic    string
 
 	messages chan *sarama.ConsumerMessage
-	errors   chan error
 
 	closed     chan struct{} // channel which is closed when the consumer is AsyncClose()ed
 	close_once sync.Once     // Once used to make sure we close only once
@@ -690,7 +675,6 @@ func (con *consumer) deliverError(context string, partition int32, err error) {
 }
 
 func (con *consumer) Messages() <-chan *sarama.ConsumerMessage { return con.messages }
-func (con *consumer) Errors() <-chan error                     { return con.errors }
 
 // close the consumer. it can safely be called multiple times
 func (con *consumer) AsyncClose() {
@@ -789,7 +773,6 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 
 		con.consumer.Close()
 		close(con.messages)
-		close(con.errors)
 
 		// send ourselves to rem_consumer
 	rem_loop:
@@ -1117,20 +1100,14 @@ func (part *partition) run() {
 				}
 			} else {
 				dbgf("draining topic %q partition %d errors", con.topic, part.partition)
-				// finish off any remaining errors, and exit
+				// deliver any remaining errors, and exit
 				for sarama_err := range errors {
-					err := part.makeConsumerError(sarama_err)
-					select {
-					case con.errors <- err:
-					case <-con.closed:
-						return
-					}
+					con.cl.deliverError("", part.makeConsumerError(sarama_err))
 				}
 				return
 			}
 		case sarama_err, ok := <-errors:
 			if ok {
-				err := part.makeConsumerError(sarama_err)
 				// pick out ErrOffsetOutOfRange errors. These happen if the consumer offset falls off the tail of the kafka log.
 				// this easily happens in two cases: when the consumer is too slow, or when the consumer has been stopped for too long.
 				// This error cannot be fixed without seeking to a valid offset. However we can't assume that OffsetNewest is the right
@@ -1145,11 +1122,7 @@ func (part *partition) run() {
 					// should we keep reading from the partition? it's unlikely to produce much
 				}
 				// and always deliver the error
-				select {
-				case con.errors <- err:
-				case <-con.closed:
-					return
-				}
+				con.cl.deliverError("", part.makeConsumerError(sarama_err))
 			} else {
 				// finish off any remaining messages, and exit
 				dbgf("draining topic %q partition %d msgs", con.topic, part.partition)
