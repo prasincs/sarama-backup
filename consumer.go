@@ -586,11 +586,13 @@ join_loop:
 					ocreq.RetentionTime = -1 // use broker's value
 				}
 				var wg sync.WaitGroup
-				wg.Add(len(consumers))
 				for _, con := range consumers {
+					// NOTE we must wait for each consumer to finish adding itself before sending the commit_req to the next consumer
+					// otherwise they race on calling ocreq.AddBlock() and will cause concurrent hashmap writes.
+					wg.Add(1)
 					con.commit_reqs <- commit_req{ocreq, &wg}
+					wg.Wait()
 				}
-				wg.Wait()
 				dbgf("sending OffsetCommitRequest %v", ocreq)
 				ocresp, err := coor.CommitOffset(ocreq)
 				dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
