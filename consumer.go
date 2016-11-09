@@ -843,6 +843,9 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 				// the oldest bucket is complete; advance the last committed offset
 				part.oldest += 64
 				part.buckets = part.buckets[1:]
+				if len(part.buckets) == 0 {
+					break
+				}
 			}
 		}
 	}
