@@ -825,15 +825,22 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 
 	// handle a message sent to us via con.done
 	done := func(msg *sarama.ConsumerMessage) {
-		dbgf("consumer %q done(%d/%d)", con.topic, msg.Partition, msg.Offset)
+		dbgf("consumer %q done(%q:%d/%d)", con.topic, msg.Topic, msg.Partition, msg.Offset)
+
+		// a sanity check, just in case someone passes the msg into the wrong consumer
+		if con.topic != msg.Topic {
+			con.deliverError("Done()", -1, fmt.Errorf("BUG: Message from topic %q passed to consumer(%q).Done()", msg.Topic, con.topic))
+			return
+		}
+
 		part := partitions[msg.Partition]
 		if part == nil {
-			dbgf("no partition %d", msg.Partition)
+			dbgf("no partition %d in topic %q", msg.Partition, con.topic)
 			return
 		}
 		delta := msg.Offset - part.oldest
 		if delta < 0 {
-			dbgf("stale message %d/%d", msg.Partition, msg.Offset)
+			dbgf("stale message %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 			return
 		}
 		index := int(delta) >> 6 //  /64
@@ -1017,7 +1024,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-con.premessages:
-			dbgf("premessage msg %d/%d", msg.Partition, msg.Offset)
+			dbgf("premessage msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 			// keep track of msg's offset so we can match it with Done, and deliver the msg
 			part := partitions[msg.Partition]
 			if part == nil {
@@ -1031,7 +1038,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			}
 			delta := msg.Offset - part.oldest
 			if delta < 0 { // || delta > max-out-of-order  (TODO)
-				dbgf("stale message %d/%d", msg.Partition, msg.Offset)
+				dbgf("stale message %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 				// we can't take this message into account
 				continue
 			}
@@ -1047,7 +1054,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			for {
 				select {
 				case con.messages <- msg:
-					dbgf("delivered msg %d/%d", msg.Partition, msg.Offset)
+					dbgf("delivered msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 					// success
 					break deliver_loop
 
@@ -1082,7 +1089,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 
 func (con *consumer) Done(msg *sarama.ConsumerMessage) {
 	// send it back to consumer.run to be processed synchronously
-	dbgf("Done(%d/%d)", msg.Partition, msg.Offset)
+	dbgf("Done(%q:%d/%d)", msg.Topic, msg.Partition, msg.Offset)
 	select {
 	case con.done <- msg:
 		// great, msg delivered
@@ -1121,7 +1128,7 @@ func (part *partition) run() {
 		select {
 		case msg, ok := <-msgs:
 			if ok {
-				dbgf("got msg %d/%d", msg.Partition, msg.Offset)
+				dbgf("got msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 				select {
 				case con.premessages <- msg:
 				case <-con.closed:
