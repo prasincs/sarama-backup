@@ -347,9 +347,10 @@ func (cl *client) run(early_rc chan<- error) {
 join_loop:
 	for {
 		if pause {
+			delay := time.Second // TODO should we increase timeouts?
+			dbgf("pausing %v", delay)
 			// pause before continuing, so we don't fail continuously too fast
-			pause = false
-			timeout := time.After(time.Second) // TODO should we increase timeouts?
+			timeout := time.After(delay)
 		pause_loop:
 			for {
 				select {
@@ -365,9 +366,11 @@ join_loop:
 					rem(r)
 				}
 			}
+			pause = false
 		}
 
 		if refresh {
+			dbgf("refreshing coordinating broker")
 			// refresh the group coordinator (because sarama caches the result, and the cache must be manually invalidated by us when we decide it might be needed)
 			err := cl.client.RefreshCoordinator(cl.group_name)
 			if err != nil {
