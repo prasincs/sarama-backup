@@ -53,7 +53,8 @@ func (err *Error) Error() string {
 // Config must not be modified. (doing so leads to data races, and may caused bugs as well).
 //
 // In addition to this config, consumer's code also looks at the sarama.Config of the sarama.Client
-// supplied to NewClient, especially at the Consumer.Offset settings, Version, and [TODO] ChannelBufferSize.
+// supplied to NewClient, especially at the Consumer.Offset settings, Version, Metadata.Retry.Backoff
+// and [TODO] ChannelBufferSize.
 type Config struct {
 	Session struct {
 		// The allowed session timeout for registered consumers (defaults to 30s).
@@ -349,7 +350,7 @@ func (cl *client) run(early_rc chan<- error) {
 join_loop:
 	for {
 		if pause {
-			delay := time.Second // TODO should we increase timeouts?
+			delay := cl.client.Config().Metadata.Retry.Backoff // TODO should we increase timeouts?
 			dbgf("pausing %v", delay)
 			// pause before continuing, so we don't fail continuously too fast
 			timeout := time.After(delay)
