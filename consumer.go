@@ -341,30 +341,13 @@ func (cl *client) run(early_rc chan<- error) {
 	}
 
 	pause := false
-	refresh := false
-	reopen := false
+	refresh := false        // refresh the coordinating broker (after an I/O error or a ErrNotCoordinatorForConsumer)
+	reopen := false         // reopen coordinating broker (after an I/O error)
 	var coor *sarama.Broker // nil, or coordinating broker
 
 	// loop rejoining the group each time the group reforms
 join_loop:
 	for {
-		if reopen {
-			if coor != nil {
-				dbgf("closing and reopening connection to coordinator %d %s", coor.ID(), coor.Addr())
-				if ok, err := coor.Connected(); ok {
-					err = coor.Close()
-					if err != nil {
-						cl.deliverError(fmt.Sprintf("Close()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
-					}
-				}
-				err := coor.Open(cl.client.Config())
-				if err != nil {
-					cl.deliverError(fmt.Sprintf("re Open()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
-				}
-			}
-			reopen = false
-		}
-
 		if pause {
 			delay := time.Second // TODO should we increase timeouts?
 			dbgf("pausing %v", delay)
@@ -386,6 +369,23 @@ join_loop:
 				}
 			}
 			pause = false
+		}
+
+		if reopen {
+			if coor != nil {
+				dbgf("closing and reopening connection to coordinator %d %s", coor.ID(), coor.Addr())
+				if ok, err := coor.Connected(); ok {
+					err = coor.Close()
+					if err != nil {
+						cl.deliverError(fmt.Sprintf("Close()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
+					}
+				}
+				err := coor.Open(cl.client.Config())
+				if err != nil {
+					cl.deliverError(fmt.Sprintf("re Open()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
+				}
+			}
+			reopen = false
 		}
 
 		if refresh {
