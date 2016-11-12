@@ -868,6 +868,11 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		coor = a.coordinator
 		member_id = a.member_id
 
+		if len(added) == 0 {
+			// we're done early
+			return
+		}
+
 		// the sarama-cluster code pauses here so that other consumers have time to sync their offsets. Should we do the same?
 		// I've observed with kafka 0.9.0.1 that once the coordinator bumps the generation_id the client can't commit an offset with
 		// the old id. So unless the client lies and sends generation_id+1 when it commits there is nothing it can commit, and there
@@ -888,81 +893,82 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		if err != nil {
 			con.deliverError("fetching offsets", -1, err)
 			// and we can't consume any of the new partitions without the offsets
-		} else if len(added) != 0 {
-			// start consuming from the added partitions at each partition's last committed offset (which by convention kafaka defines as the last consumed offset+1)
-			// since computing the starting offset and beginning to consume requires several round trips to the kafka brokers we start all the
-			// partitions concurrently. That reduces the startup time to a couple RTTs even for topics with a numerous partitions.
-			started := make(chan *partition)
-			var wg sync.WaitGroup
-			for _, p := range added {
-				wg.Add(1)
-				go func(p int32) {
-					defer wg.Done()
-					ob := oresp.GetBlock(con.topic, p)
-					if ob == nil {
-						// can't start this partition without an offset
-						con.deliverError("FetchOffset response", p, fmt.Errorf("partition %d missing", p))
+			return
+		}
+
+		// start consuming from the added partitions at each partition's last committed offset (which by convention kafaka defines as the last consumed offset+1)
+		// since computing the starting offset and beginning to consume requires several round trips to the kafka brokers we start all the
+		// partitions concurrently. That reduces the startup time to a couple RTTs even for topics with a numerous partitions.
+		started := make(chan *partition)
+		var wg sync.WaitGroup
+		for _, p := range added {
+			wg.Add(1)
+			go func(p int32) {
+				defer wg.Done()
+				ob := oresp.GetBlock(con.topic, p)
+				if ob == nil {
+					// can't start this partition without an offset
+					con.deliverError("FetchOffset response", p, fmt.Errorf("partition %d missing", p))
+					return
+				}
+				if ob.Err != 0 {
+					con.deliverError("FetchOffset response", p, ob.Err)
+					return
+				}
+
+				offset := ob.Offset
+				if offset == sarama.OffsetNewest {
+					// the broker doesn't have an offset for is. Use the configured initial offset
+					offset = con.cl.client.Config().Consumer.Offsets.Initial
+				}
+
+				dbgf("consumer %q consuming partition %d at offset %d", con.topic, p, offset)
+
+				consumer, err := con.consumer.ConsumePartition(con.topic, p, offset)
+				if err != nil {
+					con.deliverError(fmt.Sprintf("sarama.ConsumePartition at offset %d", offset), p, err)
+
+					// If the error is ErrOffsetOutOfRange then give ourselves one chance to recover
+					if err != sarama.ErrOffsetOutOfRange {
+						// otherwise we can't consume this partition.
 						return
 					}
-					if ob.Err != 0 {
-						con.deliverError("FetchOffset response", p, ob.Err)
+
+					offset, err = con.cl.config.OffsetOutOfRange(con.topic, p, con.cl.client)
+					if err != nil {
+						// should we deliver them their own error? I guess so.
+						con.deliverError("OffsetOutOfRange callback", p, err)
 						return
 					}
 
-					offset := ob.Offset
-					if offset == sarama.OffsetNewest {
-						// the broker doesn't have an offset for is. Use the configured initial offset
-						offset = con.cl.client.Config().Consumer.Offsets.Initial
-					}
-
-					dbgf("consumer %q consuming partition %d at offset %d", con.topic, p, offset)
-
-					consumer, err := con.consumer.ConsumePartition(con.topic, p, offset)
+					consumer, err = con.consumer.ConsumePartition(con.topic, p, offset)
 					if err != nil {
 						con.deliverError(fmt.Sprintf("sarama.ConsumePartition at offset %d", offset), p, err)
-
-						// If the error is ErrOffsetOutOfRange then give ourselves one chance to recover
-						if err != sarama.ErrOffsetOutOfRange {
-							// otherwise we can't consume this partition.
-							return
-						}
-
-						offset, err = con.cl.config.OffsetOutOfRange(con.topic, p, con.cl.client)
-						if err != nil {
-							// should we deliver them their own error? I guess so.
-							con.deliverError("OffsetOutOfRange callback", p, err)
-							return
-						}
-
-						consumer, err = con.consumer.ConsumePartition(con.topic, p, offset)
-						if err != nil {
-							con.deliverError(fmt.Sprintf("sarama.ConsumePartition at offset %d", offset), p, err)
-							// it didn't work with their offset either. give up
-							// (we could go into a loop and call them again, but what would that solve?)
-							return
-						}
-						// it worked with the new offset; carry on
+						// it didn't work with their offset either. give up
+						// (we could go into a loop and call them again, but what would that solve?)
+						return
 					}
+					// it worked with the new offset; carry on
+				}
 
-					part := &partition{
-						con:       con,
-						consumer:  consumer,
-						partition: p,
-						oldest:    offset,
-					}
-					go part.run()
+				part := &partition{
+					con:       con,
+					consumer:  consumer,
+					partition: p,
+					oldest:    offset,
+				}
+				go part.run()
 
-					started <- part
-				}(p)
-			}
-			go func() {
-				wg.Wait()
-				close(started)
-			}()
+				started <- part
+			}(p)
+		}
+		go func() {
+			wg.Wait()
+			close(started)
+		}()
 
-			for part := range started {
-				partitions[part.partition] = part
-			}
+		for part := range started {
+			partitions[part.partition] = part
 		}
 	}
 
