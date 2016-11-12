@@ -342,10 +342,29 @@ func (cl *client) run(early_rc chan<- error) {
 
 	pause := false
 	refresh := false
+	reopen := false
+	var coor *sarama.Broker // nil, or coordinating broker
 
 	// loop rejoining the group each time the group reforms
 join_loop:
 	for {
+		if reopen {
+			if coor != nil {
+				dbgf("closing and reopening connection to coordinator %d %s", coor.ID(), coor.Addr())
+				if ok, err := coor.Connected(); ok {
+					err = coor.Close()
+					if err != nil {
+						cl.deliverError(fmt.Sprintf("Close()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
+					}
+				}
+				err := coor.Open(cl.client.Config())
+				if err != nil {
+					cl.deliverError(fmt.Sprintf("re Open()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
+				}
+			}
+			reopen = false
+		}
+
 		if pause {
 			delay := time.Second // TODO should we increase timeouts?
 			dbgf("pausing %v", delay)
@@ -371,6 +390,7 @@ join_loop:
 
 		if refresh {
 			dbgf("refreshing coordinating broker")
+
 			// refresh the group coordinator (because sarama caches the result, and the cache must be manually invalidated by us when we decide it might be needed)
 			err := cl.client.RefreshCoordinator(cl.group_name)
 			if err != nil {
@@ -389,7 +409,8 @@ join_loop:
 		// make contact with the kafka broker coordinating this group
 		// NOTE: sarama keeps the result cached, so we aren't taking a round trip to the kafka brokers very time
 		// (then again we need to manage sarama's cache too)
-		coor, err := cl.client.Coordinator(cl.group_name)
+		var err error
+		coor, err = cl.client.Coordinator(cl.group_name)
 		if err != nil {
 			err = cl.makeError("contacting coordinating broker", err)
 			if early_rc != nil {
@@ -421,6 +442,9 @@ join_loop:
 		dbgf("sending JoinGroupRequest %v", jreq)
 		jresp, err := coor.JoinGroup(jreq)
 		dbgf("received JoinGroupResponse %v, %v", jresp, err)
+		if err != nil {
+			reopen = true
+		}
 		if err != nil || jresp.Err == sarama.ErrNotCoordinatorForConsumer {
 			// some I/O error happened, or the broker told us it is no longer the coordinator. in either case we should recompute the coordinator
 			refresh = true
@@ -476,6 +500,9 @@ join_loop:
 		dbgf("sending SyncGroupRequest %v", sreq)
 		sresp, err := coor.SyncGroup(sreq)
 		dbgf("received SyncGroupResponse %v, %v", sresp, err)
+		if err != nil {
+			reopen = true
+		}
 		if err != nil && sresp.Err == sarama.ErrNotCoordinatorForConsumer {
 			// we'll need a new coordinator
 			refresh = true
@@ -563,6 +590,9 @@ join_loop:
 				dbgf("sending HeartbeatRequest %v", req)
 				resp, err := coor.Heartbeat(req)
 				dbgf("received HeartbeatResponse %v, %v", resp, err)
+				if err != nil {
+					reopen = true
+				}
 				if err != nil || resp.Err == sarama.ErrNotCoordinatorForConsumer {
 					// we need a new coordinator
 					refresh = true
