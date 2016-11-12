@@ -503,7 +503,7 @@ join_loop:
 		if err != nil {
 			reopen = true
 		}
-		if err != nil && sresp.Err == sarama.ErrNotCoordinatorForConsumer {
+		if err != nil || sresp.Err == sarama.ErrNotCoordinatorForConsumer {
 			// we'll need a new coordinator
 			refresh = true
 		}
