@@ -387,6 +387,9 @@ join_loop:
 				}
 			}
 			reopen = false
+
+			// after reopening (successfully or not), always refresh the coordinator
+			refresh = true
 		}
 
 		if refresh {
@@ -444,13 +447,15 @@ join_loop:
 		jresp, err := coor.JoinGroup(jreq)
 		dbgf("received JoinGroupResponse %v, %v", jresp, err)
 		if err != nil {
+			// some I/O error happened; we should reopen and refresh the current coordinator
 			reopen = true
-		}
-		if err != nil || jresp.Err == sarama.ErrNotCoordinatorForConsumer {
-			// some I/O error happened, or the broker told us it is no longer the coordinator. in either case we should recompute the coordinator
-			refresh = true
-		}
-		if err == nil && jresp.Err != 0 {
+		} else if jresp.Err != 0 {
+			switch jresp.Err {
+			case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable:
+				refresh = true // the broker is no longer the coordinator. we should refresh the current coordinator
+			case sarama.ErrUnknownMemberId:
+				member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
+			}
 			err = jresp.Err
 		}
 		if err != nil {
@@ -503,12 +508,13 @@ join_loop:
 		dbgf("received SyncGroupResponse %v, %v", sresp, err)
 		if err != nil {
 			reopen = true
-		}
-		if err != nil || sresp.Err == sarama.ErrNotCoordinatorForConsumer {
-			// we'll need a new coordinator
-			refresh = true
-		}
-		if err == nil && sresp.Err != 0 {
+		} else if sresp.Err != 0 {
+			switch sresp.Err {
+			case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable:
+				refresh = true // the broker is no longer the coordinator. we should refresh the current coordinator
+			case sarama.ErrUnknownMemberId:
+				member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
+			}
 			err = sresp.Err
 		}
 		if err != nil {
@@ -554,7 +560,6 @@ join_loop:
 		commit_timer := time.After(clconfig.Consumer.Offsets.CommitInterval)
 
 		// and loop, sending heartbeats until something happens and we need to rejoin (or exit)
-	heartbeat_loop:
 		for {
 			select {
 			case <-cl.closed:
@@ -571,6 +576,7 @@ join_loop:
 				dbgf("sending LeaveGroupRequest %v", req)
 				resp, err := coor.LeaveGroup(req)
 				dbgf("received LeaveGroupResponse %v, %v", resp, err)
+				// note: we don't bother with the full error handling code, since we're exiting anyway
 				if err == nil && resp.Err != 0 {
 					err = resp.Err
 				}
@@ -593,15 +599,19 @@ join_loop:
 				dbgf("received HeartbeatResponse %v, %v", resp, err)
 				if err != nil {
 					reopen = true
+				} else if resp.Err != 0 {
+					switch resp.Err {
+					case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable:
+						refresh = true // the broker is no longer the coordinator. we should refresh the current coordinator
+					case sarama.ErrUnknownMemberId:
+						member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
+					}
+					err = resp.Err
 				}
-				if err != nil || resp.Err == sarama.ErrNotCoordinatorForConsumer {
-					// we need a new coordinator
-					refresh = true
-					continue join_loop
-				}
-				if err != nil || resp.Err != 0 {
+				if err != nil {
+					cl.deliverError("heartbeating", err)
 					// we've got heartbeat troubles of one kind or another; disconnect and reconnect
-					break heartbeat_loop
+					continue join_loop
 				}
 
 				// and start the next heartbeat only after we get the response to this one
@@ -633,14 +643,25 @@ join_loop:
 				// log any errors we got. there isn't much we can do about them
 				if err != nil {
 					cl.deliverError("committing offsets", err)
+					reopen = true
 				} else {
 					for topic, partitions := range ocresp.Errors {
-						for p, err := range partitions {
-							if err != 0 {
-								cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), err)
+						for p, kerr := range partitions {
+							if kerr != 0 {
+								cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), kerr)
+								switch kerr {
+								case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable:
+									refresh = true // the broker is no longer the coordinator. we should refresh the current coordinator
+								case sarama.ErrUnknownMemberId:
+									member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
+								}
+								err = kerr // any of the kerr's will do
 							}
 						}
 					}
+				}
+				if err != nil {
+					continue join_loop
 				}
 
 				commit_timer = time.After(clconfig.Consumer.Offsets.CommitInterval)
@@ -654,7 +675,7 @@ join_loop:
 				// and rejoin so we can be removed as member of the new topic
 				continue join_loop
 			}
-		} // end of heartbeat_loop
+		} // end of heartbeat loop
 	} // end of join_loop
 }
 
