@@ -451,7 +451,7 @@ join_loop:
 			reopen = true
 		} else if jresp.Err != 0 {
 			switch jresp.Err {
-			case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable:
+			case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
 				refresh = true // the broker is no longer the coordinator. we should refresh the current coordinator
 			case sarama.ErrUnknownMemberId:
 				member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
@@ -510,7 +510,7 @@ join_loop:
 			reopen = true
 		} else if sresp.Err != 0 {
 			switch sresp.Err {
-			case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable:
+			case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
 				refresh = true // the broker is no longer the coordinator. we should refresh the current coordinator
 			case sarama.ErrUnknownMemberId:
 				member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
@@ -601,7 +601,7 @@ join_loop:
 					reopen = true
 				} else if resp.Err != 0 {
 					switch resp.Err {
-					case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable:
+					case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
 						refresh = true // the broker is no longer the coordinator. we should refresh the current coordinator
 					case sarama.ErrUnknownMemberId:
 						member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
@@ -650,7 +650,7 @@ join_loop:
 							if kerr != 0 {
 								cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), kerr)
 								switch kerr {
-								case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable:
+								case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
 									refresh = true // the broker is no longer the coordinator. we should refresh the current coordinator
 								case sarama.ErrUnknownMemberId:
 									member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
