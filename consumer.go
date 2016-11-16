@@ -16,11 +16,19 @@ import (
 	"github.com/Shopify/sarama"
 )
 
-const debug = true // set to true to see log messages
+const debug = true          // set to true to see debug messages
+const per_msg_debug = false // set to true to see per-message debug messages
 
 // dbgf logs a printf style message to somewhere reasonable if debug is enabled, and as efficiently as it can does nothing with any side effects if debug is disabled
 func dbgf(fmt string, args ...interface{}) {
 	if debug {
+		log.Printf(fmt, args...)
+	}
+}
+
+// msgf is similar to dbgf but used for per-message debug messages. since these are so numerous there's a separate compile-time flag to compile these out
+func msgf(fmt string, args ...interface{}) {
+	if per_msg_debug {
 		log.Printf(fmt, args...)
 	}
 }
@@ -877,7 +885,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 
 	// handle a message sent to us via con.done
 	done := func(msg *sarama.ConsumerMessage) {
-		dbgf("consumer %q done(%q:%d/%d)", con.topic, msg.Topic, msg.Partition, msg.Offset)
+		msgf("consumer %q done(%q:%d/%d)", con.topic, msg.Topic, msg.Partition, msg.Offset)
 
 		// a sanity check, just in case someone passes the msg into the wrong consumer
 		if con.topic != msg.Topic {
@@ -1076,7 +1084,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-con.premessages:
-			dbgf("premessage msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
+			msgf("premessage msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 			// keep track of msg's offset so we can match it with Done, and deliver the msg
 			part := partitions[msg.Partition]
 			if part == nil {
@@ -1106,7 +1114,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			for {
 				select {
 				case con.messages <- msg:
-					dbgf("delivered msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
+					msgf("delivered msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 					// success
 					break deliver_loop
 
@@ -1141,7 +1149,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 
 func (con *consumer) Done(msg *sarama.ConsumerMessage) {
 	// send it back to consumer.run to be processed synchronously
-	dbgf("Done(%q:%d/%d)", msg.Topic, msg.Partition, msg.Offset)
+	msgf("Done(%q:%d/%d)", msg.Topic, msg.Partition, msg.Offset)
 	select {
 	case con.done <- msg:
 		// great, msg delivered
@@ -1180,7 +1188,7 @@ func (part *partition) run() {
 		select {
 		case msg, ok := <-msgs:
 			if ok {
-				dbgf("got msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
+				msgf("got msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 				select {
 				case con.premessages <- msg:
 				case <-con.closed:
