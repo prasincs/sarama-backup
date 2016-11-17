@@ -439,7 +439,7 @@ join_loop:
 			refresh = true
 			continue join_loop
 		}
-		dbgf("Coordinator %v", coor)
+		dbgf("Coordinator %v %v", coor.ID(), coor.Addr())
 
 		// join the group
 		jreq := &sarama.JoinGroupRequest{
