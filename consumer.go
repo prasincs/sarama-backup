@@ -61,7 +61,7 @@ func (err *Error) Error() string {
 // Config must not be modified. (doing so leads to data races, and may caused bugs as well).
 //
 // In addition to this config, consumer's code also looks at the sarama.Config of the sarama.Client
-// supplied to NewClient, especially at the Consumer.Offset settings, Version, Metadata.Retry.Backoff
+// supplied to NewClient, especially at the Consumer.Offsets settings, Version, Metadata.Retry.Backoff
 // and [TODO] ChannelBufferSize.
 type Config struct {
 	Session struct {
@@ -84,16 +84,31 @@ type Config struct {
 	// the partitioner used to map partitions to consumer group members (defaults to a round-robin partitioner)
 	Partitioner Partitioner
 
-	// The handler for sarama.ErrOffsetOutOfRange errors (defaults to sarama.OffsetNewest,nil). Implementation
-	// must return the new starting offset in the partition, or an error. The sarama.Client is included for
-	// convenience, since handling this might involve querying the partition's current offsets.
+	// OffsetOutOfRange is the handler for sarama.ErrOffsetOutOfRange errors (defaults to sarama.OffsetNewest,nil).
+	// Implementations must return the new starting offset in the partition, or an error. The sarama.Client is included
+	// for convenience, since handling this might involve querying the partition's current offsets.
 	OffsetOutOfRange func(topic string, partition int32, client sarama.Client) (offset int64, err error)
+
+	// StartingOffset is a hook to allow modifying the starting offset when a Consumer begins to consume
+	// a partition. (defaults to returning the last committed offset). Some consumers might want to jump
+	// ahead to fresh messages. The sarama.Client is included for convenience, since handling this might involve
+	// looking up a partition's offset by time. When no committed offset could be found -1 (sarama.OffsetNewest)
+	// is passed in. An implementation might want to return client.Config().Consumer.Offsets.Initial in that case.
+	StartingOffset func(topic string, partition int32, committed_offset int64, client sarama.Client) (offset int64, err error)
 }
 
-// default implementation of Config.Offsets.OffsetOutOfRange jumps to the current head of the partition.
-func DefaultOffsetOutOfRange(topic string, partition int32, client sarama.Client) (offset int64, err error) {
-	offset = sarama.OffsetNewest
-	return
+// default implementation of Config.OffsetOutOfRange jumps to the current head of the partition.
+func DefaultOffsetOutOfRange(topic string, partition int32, client sarama.Client) (int64, error) {
+	return sarama.OffsetNewest, nil
+}
+
+// default implementation of Config.StartingOffset starts at the committed offset, or at sarama.Config.Consumer.Offsets.Initial
+// if there is no comitted offset.
+func DefaultStartingOffset(topic string, partition int32, offset int64, client sarama.Client) (int64, error) {
+	if offset == sarama.OffsetNewest {
+		offset = client.Config().Consumer.Offsets.Initial
+	}
+	return offset, nil
 }
 
 // NewConfig constructs a default configuration.
@@ -104,6 +119,7 @@ func NewConfig() *Config {
 	cfg.Heartbeat.Interval = 3 * time.Second
 	cfg.Partitioner = RoundRobin
 	cfg.OffsetOutOfRange = DefaultOffsetOutOfRange
+	cfg.StartingOffset = DefaultStartingOffset
 	return cfg
 }
 
@@ -122,7 +138,7 @@ func NewConfig() *Config {
   where sarama.Config.Version is >= consumer.MinVersion, and if full handling of
   ErrOffsetOutOfRange is desired, sarama.Config.Consumer.Return.Errors = true.
 
-  In addition, this package uses the settings in sarama.Config.Consumer.Offset
+  In addition, this package uses the settings in sarama.Config.Consumer.Offsets
 */
 func NewClient(group_name string, config *Config, sarama_client sarama.Client) (Client, error) {
 
@@ -200,7 +216,7 @@ type Consumer interface {
 	// Never calling AsyncClose is also permitted. Client.Close() implies Consumer.AsyncClose.
 	AsyncClose()
 
-	// Close() terminates the consumer and waits for it to be finished comitting the current
+	// Close() terminates the consumer and waits for it to be finished committing the current
 	// offsets to kafka. Calling twice happens to work at the moment, but let's not encourage it.
 	Close()
 }
@@ -999,10 +1015,11 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 					return
 				}
 
-				offset := ob.Offset
-				if offset == sarama.OffsetNewest {
-					// the broker doesn't have an offset for is. Use the configured initial offset
-					offset = con.cl.client.Config().Consumer.Offsets.Initial
+				// run the committed offset through the StartingOffset() hook
+				offset, err := con.cl.config.StartingOffset(con.topic, p, ob.Offset, con.cl.client)
+				if err != nil {
+					con.deliverError("StartingOffset", p, err)
+					return
 				}
 
 				dbgf("consumer %q consuming partition %d at offset %d", con.topic, p, offset)

@@ -9,12 +9,17 @@ https://cwiki.apache.org/confluence/display/KAFKA/Kafka+Client-side+Assignment+P
 
 CONFIGURATION
 
-Two customization APIs may be set in the Config:
+Three customization APIs may be set in the Config:
 
-Config.Offset.OffsetOutOfRange func(topic, partition, sarama.Client) (restart_offset int64, error)
+Config.Offset.OffsetOutOfRange func(topic, partition, sarama.Client) (restart_offset, error)
 allows users to decide how to react to falling off the tail of the kafka log. The default is to
 restart at the newest offset. However depending on the use case restarting at an offset T time in
 the past, or even the oldest offset, may make more sense.
+
+Config.StartingOffset func(topic, partition, committed_offset, sarama.Client) (starting_offset, error)
+allows users to decide where to restart when consuming a partition. The default is to restart at
+the committed offset, or at sarama.Config.Consumer.Offsets.Initial if the starting offset is -1
+(indicating no committed offset could be found).
 
 Config.Partitioner interface allows users to control how the consumer group distributes partitions
 across the group members. The default is to distribute the partitions of each topic round-robin across
