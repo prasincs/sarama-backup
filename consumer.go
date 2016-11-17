@@ -154,8 +154,7 @@ type Client interface {
 	Consume(topic string) (Consumer, error)
 
 	// Close closes the client. It must be called to shutdown
-	// the client. It calls AsyncClose on any yet unclosed topic
-	// Consumers created by this Client.
+	// the client. It cleans up any unclosed topic Consumers created by this Client.
 	// It does NOT close the inner sarama.Client.
 	// Calling twice is NOT supported.
 	Close()
@@ -202,7 +201,7 @@ type Consumer interface {
 	AsyncClose()
 
 	// Close() terminates the consumer and waits for it to be finished comitting the current
-	// offsets to kafka.
+	// offsets to kafka. Calling twice happens to work at the moment, but let's not encourage it.
 	Close()
 }
 
