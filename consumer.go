@@ -200,6 +200,10 @@ type Consumer interface {
 	// Calling AsyncClose multiple times is permitted. Only the first call has any effect.
 	// Never calling AsyncClose is also permitted. Client.Close() implies Consumer.AsyncClose.
 	AsyncClose()
+
+	// Close() terminates the consumer and waits for it to be finished comitting the current
+	// offsets to kafka.
+	Close()
 }
 
 /*
@@ -266,6 +270,7 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 		messages: make(chan *sarama.ConsumerMessage),
 
 		closed: make(chan struct{}),
+		exited: make(chan struct{}),
 
 		assignments: make(chan *assignment, 1),
 		commit_reqs: make(chan commit_req),
@@ -717,6 +722,7 @@ type consumer struct {
 
 	closed     chan struct{} // channel which is closed when the consumer is AsyncClose()ed
 	close_once sync.Once     // Once used to make sure we close only once
+	exited     chan struct{} // channel which is closed when the consumer is far enough along in exiting that consumer.Close can return
 
 	assignments chan *assignment // channel over which client.run sends consumer.run each generation's partition assignments
 	commit_reqs chan commit_req  // channel over which client.run sends consumer.run request to fill out a OffsetCommitRequest
@@ -761,6 +767,13 @@ func (con *consumer) Messages() <-chan *sarama.ConsumerMessage { return con.mess
 func (con *consumer) AsyncClose() {
 	dbgf("AsyncClose consumer of topic %q", con.topic)
 	con.close_once.Do(func() { close(con.closed) })
+}
+
+// close the consumer and wait
+func (con *consumer) Close() {
+	dbgf("Close consumer of topic %q", con.topic)
+	con.AsyncClose() // initiate the shutdown
+	<-con.exited     // and wait around until it is complete
 }
 
 // consumer goroutine coordinates consuming from multiple partitions in a topic
@@ -880,6 +893,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		}
 
 		dbgf("consumer of topic %q exiting", con.topic)
+		close(con.exited)
 		wg.Done()
 	}()
 
