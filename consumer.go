@@ -19,17 +19,20 @@ import (
 const debug = true          // set to true to see debug messages
 const per_msg_debug = false // set to true to see per-message debug messages
 
+// low level logging function. Replace it with your own if desired before making any calls to the rest of the API
+var Logf func(fmt string, args ...interface{}) = log.Printf
+
 // dbgf logs a printf style message to somewhere reasonable if debug is enabled, and as efficiently as it can does nothing with any side effects if debug is disabled
 func dbgf(fmt string, args ...interface{}) {
 	if debug {
-		log.Printf(fmt, args...)
+		Logf(fmt, args...)
 	}
 }
 
 // msgf is similar to dbgf but used for per-message debug messages. since these are so numerous there's a separate compile-time flag to compile these out
 func msgf(fmt string, args ...interface{}) {
 	if per_msg_debug {
-		log.Printf(fmt, args...)
+		Logf(fmt, args...)
 	}
 }
 
