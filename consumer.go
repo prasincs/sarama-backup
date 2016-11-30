@@ -520,7 +520,7 @@ join_loop:
 		// save our member_id for next time we join, and the new generation id
 		member_id = jresp.MemberId
 		generation_id := jresp.GenerationId
-		dbgf("member_id %q, generation_id %d", member_id, generation_id)
+		logf("consumer %q joining generation %d as member %q", cl.group_name, generation_id, member_id)
 
 		// prepare a sync request
 		sreq := &sarama.SyncGroupRequest{
