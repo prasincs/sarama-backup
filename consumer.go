@@ -16,11 +16,19 @@ import (
 	"github.com/Shopify/sarama"
 )
 
-const debug = true          // set to true to see debug messages
+const logging = true        // set to true to see log messages
+const debug = false         // set to true to see debug messages
 const per_msg_debug = false // set to true to see per-message debug messages
 
 // low level logging function. Replace it with your own if desired before making any calls to the rest of the API
 var Logf func(fmt string, args ...interface{}) = log.Printf
+
+// logf logs a printf style message if log is enabled
+func logf(fmt string, args ...interface{}) {
+	if logging {
+		Logf(fmt, args...)
+	}
+}
 
 // dbgf logs a printf style message to somewhere reasonable if debug is enabled, and as efficiently as it can does nothing with any side effects if debug is disabled
 func dbgf(fmt string, args ...interface{}) {
@@ -729,7 +737,7 @@ func (cl *client) deliverError(context string, err error) {
 	if context != "" {
 		err = cl.makeError(context, err)
 	}
-	dbgf("%v", err)
+	logf("%v", err)
 	cl.errors <- err
 }
 
@@ -839,6 +847,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 				}
 				dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
 				ocreq.AddBlock(con.topic, p, offset, 0, "")
+				logf("consumer %q stopped consuming partition %d at offset %d", con.topic, p, offset)
 			}
 		}
 		dbgf("sending OffsetCommitRequest %v", ocreq)
@@ -1028,7 +1037,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 					return
 				}
 
-				dbgf("consumer %q consuming partition %d at offset %d", con.topic, p, offset)
+				logf("consumer %q consuming partition %d at offset %d", con.topic, p, offset)
 
 				consumer, err := con.consumer.ConsumePartition(con.topic, p, offset)
 				if err != nil {
@@ -1106,6 +1115,8 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			con.deliverError(fmt.Sprintf("sarama.ConsumePartition at offset %d", offset), p, err)
 			return
 		}
+
+		logf("consumer %q restarting consuming partition %d at offset %d", con.topic, p, offset)
 
 		part = &partition{
 			con:       con,
