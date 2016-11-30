@@ -103,7 +103,7 @@ func DefaultOffsetOutOfRange(topic string, partition int32, client sarama.Client
 }
 
 // default implementation of Config.StartingOffset starts at the committed offset, or at sarama.Config.Consumer.Offsets.Initial
-// if there is no comitted offset.
+// if there is no committed offset.
 func DefaultStartingOffset(topic string, partition int32, offset int64, client sarama.Client) (int64, error) {
 	if offset == sarama.OffsetNewest {
 		offset = client.Config().Consumer.Offsets.Initial
