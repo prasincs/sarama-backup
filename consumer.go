@@ -585,7 +585,10 @@ join_loop:
 		heartbeat_timer := time.After(cl.config.Heartbeat.Interval)
 		// and the offset commit timer
 		clconfig := cl.client.Config()
-		commit_timer := time.After(clconfig.Consumer.Offsets.CommitInterval)
+		var commit_timer <-chan time.Time
+		if clconfig.Consumer.Offsets.CommitInterval > 0 {
+			commit_timer = time.After(clconfig.Consumer.Offsets.CommitInterval)
+		} // else don't commit periodically (we still commit when closing down)
 
 		// and loop, sending heartbeats until something happens and we need to rejoin (or exit)
 		for {
