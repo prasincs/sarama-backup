@@ -567,6 +567,7 @@ join_loop:
 			pause = true
 			continue join_loop
 		}
+		logf("consumer %q partition assignment: %v", cl.group_name, assignments)
 
 		// save and distribute the new assignments to our topic consumers
 		a := &assignment{
