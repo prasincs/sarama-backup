@@ -38,9 +38,11 @@ func dbgf(fmt string, args ...interface{}) {
 }
 
 // msgf is similar to dbgf but used for per-message debug messages. since these are so numerous there's a separate compile-time flag to compile these out
-func msgf(fmt string, args ...interface{}) {
+// in addition, since the go 1.7 compiler isn't eliminating the call sufficiently to avoid allocating the []interface{} needed by "args...interface{}",
+// we pass the pointer to the msg. That works and doesn't show up in the heap gc'ed trash profile (pprof -alloc_space)
+func msgf(fmt string, msg *sarama.ConsumerMessage) {
 	if per_msg_debug {
-		Logf(fmt, args...)
+		Logf(fmt, msg.Topic, msg.Partition, msg.Offset)
 	}
 }
 
@@ -930,7 +932,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 
 	// handle a message sent to us via con.done
 	done := func(msg *sarama.ConsumerMessage) {
-		msgf("consumer %q done(%q:%d/%d)", con.topic, msg.Topic, msg.Partition, msg.Offset)
+		msgf("consumer done(%q:%d/%d)", msg)
 
 		// a sanity check, just in case someone passes the msg into the wrong consumer
 		if con.topic != msg.Topic {
@@ -1132,7 +1134,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-con.premessages:
-			msgf("premessage msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
+			msgf("premessage msg %q:%d/%d", msg)
 			// keep track of msg's offset so we can match it with Done, and deliver the msg
 			part := partitions[msg.Partition]
 			if part == nil {
@@ -1162,7 +1164,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			for {
 				select {
 				case con.messages <- msg:
-					msgf("delivered msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
+					msgf("delivered msg %q:%d/%d", msg)
 					// success
 					break deliver_loop
 
@@ -1197,7 +1199,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 
 func (con *consumer) Done(msg *sarama.ConsumerMessage) {
 	// send it back to consumer.run to be processed synchronously
-	msgf("Done(%q:%d/%d)", msg.Topic, msg.Partition, msg.Offset)
+	msgf("Done(%q:%d/%d)", msg)
 	select {
 	case con.done <- msg:
 		// great, msg delivered
@@ -1236,7 +1238,7 @@ func (part *partition) run() {
 		select {
 		case msg, ok := <-msgs:
 			if ok {
-				msgf("got msg %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
+				msgf("got msg %q:%d/%d", msg)
 				select {
 				case con.premessages <- msg:
 				case <-con.closed:
