@@ -571,7 +571,13 @@ join_loop:
 			pause = true
 			continue join_loop
 		}
-		logf("consumer %q partition assignment: %v", cl.group_name, assignments)
+
+		// keep track of how many partitions we are assigned
+		num_assigned_partitions := 0
+		for _, parts := range assignments {
+			num_assigned_partitions += len(parts)
+		}
+		logf("consumer %q assigned %d partitions; assignment: %v", cl.group_name, num_assigned_partitions, assignments)
 
 		// save and distribute the new assignments to our topic consumers
 		a := &assignment{
@@ -677,12 +683,18 @@ join_loop:
 					ocreq.RetentionTime = -1 // use broker's value
 				}
 				var wg sync.WaitGroup
+				resp := make(chan commit_resp, num_assigned_partitions) // allocating room for the responses helps the code run smoothly
 				for _, con := range consumers {
-					// NOTE we must wait for each consumer to finish adding itself before sending the commit_req to the next consumer
-					// otherwise they race on calling ocreq.AddBlock() and will cause concurrent hashmap writes.
 					wg.Add(1)
-					con.commit_reqs <- commit_req{ocreq, &wg}
+					con.commit_reqs <- commit_req{resp, &wg}
+				}
+				go func(resp chan commit_resp, wg *sync.WaitGroup) {
 					wg.Wait()
+					close(resp)
+				}(resp, &wg)
+				for r := range resp {
+					dbgf("ocreq.AddBlock(%q, %d, %d)", r.topic, r.partition, r.offset)
+					ocreq.AddBlock(r.topic, r.partition, r.offset, 0, "")
 				}
 				dbgf("sending OffsetCommitRequest %v", ocreq)
 				ocresp, err := coor.CommitOffset(ocreq)
@@ -766,10 +778,17 @@ type consumer struct {
 	done               chan *sarama.ConsumerMessage // channel through which Done() returns messages
 }
 
-// commit_req is a request for a consumer to write its part into a OffsetCommitRequest
+// commit_req is a request for a consumer to send back the client its part into a OffsetCommitRequest
 type commit_req struct {
-	ocreq *sarama.OffsetCommitRequest
-	wg    *sync.WaitGroup
+	resp chan<- commit_resp
+	wg   *sync.WaitGroup
+}
+
+type commit_resp struct {
+	topic     string
+	partition int32
+	offset    int64
+	// if someday we make use of the timestamp and metadata fields we'd add them here
 }
 
 // assignment is this client's assigned partitions
@@ -883,8 +902,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 					offset += int64(partition.buckets[0][1])
 				} // else we don't know enough to commit any further
 			}
-			dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
-			c.ocreq.AddBlock(con.topic, p, offset, 0, "")
+			c.resp <- commit_resp{con.topic, p, offset}
 		}
 		c.wg.Done()
 	}
