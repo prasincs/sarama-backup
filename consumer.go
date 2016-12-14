@@ -290,12 +290,14 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 		return nil, cl.makeError("Consume sarama.NewConsumerFromClient", err)
 	}
 
+	chanbufsize := cl.client.Config().ChannelBufferSize // give ourselves some capacity once I know it runs right without any (capacity hides bugs :-)
+
 	con := &consumer{
 		cl:       cl,
 		consumer: sarama_consumer,
 		topic:    topic,
 
-		messages: make(chan *sarama.ConsumerMessage),
+		messages: make(chan *sarama.ConsumerMessage, chanbufsize),
 
 		closed: make(chan struct{}),
 		exited: make(chan struct{}),
@@ -304,8 +306,8 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 		commit_reqs: make(chan commit_req),
 
 		restart_partitions: make(chan *partition),
-		premessages:        make(chan *sarama.ConsumerMessage), // TODO give ourselves some capacity once I know it runs right without any (capacity hides bugs :-)
-		done:               make(chan *sarama.ConsumerMessage), // we should probably use sarama.Config.ChannelBufferSize for our channels
+		premessages:        make(chan *sarama.ConsumerMessage, chanbufsize),
+		done:               make(chan *sarama.ConsumerMessage, chanbufsize),
 	}
 
 	reply := make(chan error)
