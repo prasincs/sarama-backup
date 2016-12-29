@@ -4,7 +4,7 @@
   Copyright 2016 MistSys
 */
 
-package consumer
+package roundrobin_test
 
 import (
 	"fmt"
@@ -12,10 +12,12 @@ import (
 	"testing"
 
 	"github.com/Shopify/sarama"
+	consumer "github.com/mistsys/sarama-consumer"
+	"github.com/mistsys/sarama-consumer/roundrobin"
 )
 
 func TestRoundRobin(t *testing.T) {
-	var rr Partitioner = RoundRobin
+	var rr consumer.Partitioner = roundrobin.RoundRobin
 
 	var mock_client = mockClient{
 		config: sarama.NewConfig(),
@@ -38,11 +40,11 @@ func TestRoundRobin(t *testing.T) {
 
 	var jresp = sarama.JoinGroupResponse{
 		GenerationId:  1,
-		GroupProtocol: string(RoundRobin),
+		GroupProtocol: string(roundrobin.RoundRobin),
 		Members:       make(map[string][]byte),
 	}
 	for i := range jreqs {
-		jresp.Members[jreqs[i].MemberId] = jreqs[i].GroupProtocols[string(RoundRobin)]
+		jresp.Members[jreqs[i].MemberId] = jreqs[i].GroupProtocols[string(roundrobin.RoundRobin)]
 	}
 	t.Logf("JoinGroupResponse = %v\n", jresp)
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/mistsys/sarama-consumer/roundrobin"
 )
 
 const logging = true        // set to true to see log messages
@@ -130,7 +131,7 @@ func NewConfig() *Config {
 	cfg.Session.Timeout = 30 * time.Second
 	cfg.Rebalance.Timeout = 30 * time.Second
 	cfg.Heartbeat.Interval = 3 * time.Second
-	cfg.Partitioner = RoundRobin
+	cfg.Partitioner = roundrobin.RoundRobin
 	cfg.OffsetOutOfRange = DefaultOffsetOutOfRange
 	cfg.StartingOffset = DefaultStartingOffset
 	return cfg

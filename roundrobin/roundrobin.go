@@ -1,14 +1,14 @@
 /*
-The simplest partitioner: assign partitioned round-robin
+ The simplest partitioner: assign partitions round-robin
 
  This partitioner is not that always suitable because any change
- in the consumer group resukts in an almost complete reassignment of
+ in the consumer group results in an almost complete reassignment of
  partitions.
 
   Copyright 2016 MistSys
 */
 
-package consumer
+package roundrobin
 
 import (
 	"fmt"
@@ -33,7 +33,7 @@ func (rr roundRobinPartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topic
 // for each topic in jresp, assign the topic's partitions round-robin across the members requesting each topic
 func (roundRobinPartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
 	by_member, err := jresp.GetMembers()
-	dbgf("by_member %v", by_member)
+	//dbgf("by_member %v", by_member)
 	if err != nil {
 		return err
 	}
@@ -50,13 +50,13 @@ func (roundRobinPartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 			by_topic[topic] = append(by_topic[topic], member)
 		}
 	}
-	dbgf("by_topic %v", by_topic)
+	//dbgf("by_topic %v", by_topic)
 
 	// finally, build our assignments of partitions to members
 	assignments := make(map[string]map[string][]int32) // map of member to topics, and topic to partitions
 	for topic, members := range by_topic {
 		partitions, err := client.Partitions(topic)
-		dbgf("Partitions(%q) = %v", topic, partitions)
+		//dbgf("Partitions(%q) = %v", topic, partitions)
 		if err != nil {
 			// what to do? we could maybe skip the topic, assigning it to no-one. But I/O errors are likely to happen again.
 			// so let's stop partitioning and return the error.
@@ -83,7 +83,7 @@ func (roundRobinPartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 			}
 		}
 	}
-	dbgf("assignments %v", assignments)
+	//dbgf("assignments %v", assignments)
 
 	// and encode the assignments in the sync request
 	for member_id, topics := range assignments {
@@ -103,7 +103,7 @@ func (roundRobinPartitioner) ParseSync(sresp *sarama.SyncGroupResponse) (map[str
 		return nil, nil
 	}
 	ma, err := sresp.GetMemberAssignment()
-	dbgf("MemberAssignment %v", ma)
+	//dbgf("MemberAssignment %v", ma)
 	if err != nil {
 		return nil, err
 	}
