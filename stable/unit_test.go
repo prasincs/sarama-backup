@@ -8,7 +8,6 @@ package stable_test
 
 import (
 	"fmt"
-	"reflect"
 	"testing"
 
 	"github.com/Shopify/sarama"
@@ -19,21 +18,25 @@ import (
 func TestRoundRobin(t *testing.T) {
 	var rr consumer.Partitioner = stable.Stable
 
+	all_topics := []string{"topic1", "topic2", "topic3", "topic4"}
+
 	var mock_client = mockClient{
 		config: sarama.NewConfig(),
 		partitions: map[string][]int32{
 			"topic1": []int32{0, 1 /*,no 2*/, 3, 4, 5, 6, 7}, // note we pretend partition 2 is offline
 			"topic2": []int32{0, 1},
+			"topic3": []int32{0, 1, 2, 3, 4, 5}, // exactly 2 partitions per member
+			"topic4": []int32{0, 1, 2},          // exactly 1 partitions per member
 		},
 	}
 
-	// pretend to have 3 members, all asking for two topics
+	// pretend to have 3 members, with no current assignments, all asking for the four topics
 	var jreqs [3]sarama.JoinGroupRequest
 	for i := range jreqs {
 		jreqs[i].GroupId = "group"
 		jreqs[i].MemberId = fmt.Sprintf("member%d", i)
 		jreqs[i].ProtocolType = "consumer"
-		rr.PrepareJoin(&jreqs[i], []string{"topic1", "topic2"}, nil)
+		rr.PrepareJoin(&jreqs[i], all_topics, nil)
 
 		t.Logf("JoinGroupRequests[%d] = %v\n", i, jreqs[i])
 	}
@@ -59,18 +62,11 @@ func TestRoundRobin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// check the results assigned to each of the 3 consumers
-	// since RR depends on hash order, and that changes, we can't be sure which result each consumer gets,
-	// but there are only 3 possible results
-	var expected = map[int]map[string][]int32{
-		0: map[string][]int32{"topic1": []int32{0, 4, 7}, "topic2": []int32{0}},
-		1: map[string][]int32{"topic1": []int32{1, 5}, "topic2": []int32{1}},
-		2: map[string][]int32{"topic1": []int32{3, 6}},
-	}
-
+	assignments := make(map[string]map[string][]int32) // map of member to topic to the assigned list of partitions
 	for i := range jreqs {
+		id := jreqs[i].MemberId
 		var sresp = sarama.SyncGroupResponse{
-			MemberAssignment: sreq.GroupAssignments[jreqs[i].MemberId],
+			MemberAssignment: sreq.GroupAssignments[id],
 		}
 
 		act, err := rr.ParseSync(&sresp)
@@ -78,16 +74,39 @@ func TestRoundRobin(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		t.Logf("%s assignment %v\n", jreqs[i].MemberId, act)
+		t.Logf("%s assignment %v\n", id, act)
 
-		for i, ex := range expected {
-			if reflect.DeepEqual(ex, act) {
-				delete(expected, i)
-				goto matched
+		assignments[id] = act
+	}
+
+	for _, topic := range all_topics {
+		low := 1 << 30
+		high := 0
+		used := make(map[int32]string)
+		for id, act := range assignments {
+			a := act[topic]
+
+			// keep track of the high and low # of partitions that have been assigned
+			n := len(a)
+			if low > n {
+				low = n
+			}
+			if high < n {
+				high = n
+			}
+
+			// and make sure no partition is assigned twice
+			for id2, p := range a {
+				if _, ok := used[p]; ok {
+					t.Errorf("Partition %d of topic %q is assigned to multiple consumers, including %v and %v", p, topic, id, id2)
+				}
+				used[p] = id
 			}
 		}
-		t.Errorf("Unexpected assignment %v\n(Expected one of %v)\n", act, expected)
-	matched:
+		t.Logf("topic %q assigned partitions as %v", topic, used)
+		if low != high && low != high-1 {
+			t.Errorf("Partition assignment of topic %q is uneven. Some have %d and some have %d", topic, low, high)
+		}
 	}
 }
 
