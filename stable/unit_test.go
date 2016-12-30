@@ -15,7 +15,7 @@ import (
 	"github.com/mistsys/sarama-consumer/stable"
 )
 
-func TestRoundRobin(t *testing.T) {
+func TestGreenfield(t *testing.T) {
 	var rr consumer.Partitioner = stable.Stable
 
 	all_topics := []string{"topic1", "topic2", "topic3", "topic4"}
