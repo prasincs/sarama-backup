@@ -15,10 +15,12 @@ import (
 	"github.com/mistsys/sarama-consumer/stable"
 )
 
+type assignments map[string]map[string][]int32 // map of member to topic to the assigned list of partitions
+
 func TestGreenfield(t *testing.T) {
 	var partitioner consumer.Partitioner = stable.Stable
 
-	all_topics := []string{"topic1", "topic2", "topic3", "topic4"}
+	topics := []string{"topic1", "topic2", "topic3", "topic4"}
 
 	var mock_client = mockClient{
 		config: sarama.NewConfig(),
@@ -30,17 +32,22 @@ func TestGreenfield(t *testing.T) {
 		},
 	}
 
-	// pretend to have 3 members, with no current assignments, all asking for the four topics
+	// pretend to have 3 members, with no current assignments, asking for all four topics
 	var jreqs [3]sarama.JoinGroupRequest
 	for i := range jreqs {
 		jreqs[i].GroupId = "group"
 		jreqs[i].MemberId = fmt.Sprintf("member%d", i)
 		jreqs[i].ProtocolType = "consumer"
-		partitioner.PrepareJoin(&jreqs[i], all_topics, nil)
+		partitioner.PrepareJoin(&jreqs[i], topics, nil)
 
 		t.Logf("JoinGroupRequests[%d] = %v\n", i, jreqs[i])
 	}
 
+	join_and_sync(jreqs[:], partitioner, &mock_client, t)
+}
+
+// join and sync and sanity check and return the resulting assignment
+func join_and_sync(jreqs []sarama.JoinGroupRequest, partitioner consumer.Partitioner, client sarama.Client, t *testing.T) assignments {
 	var jresp = sarama.JoinGroupResponse{
 		GenerationId:  1,
 		GroupProtocol: string(stable.Stable),
@@ -56,19 +63,21 @@ func TestGreenfield(t *testing.T) {
 		GenerationId: 1,
 		MemberId:     "member0",
 	}
-	err := partitioner.Partition(&sreq, &jresp, &mock_client)
+	err := partitioner.Partition(&sreq, &jresp, client)
 	t.Logf("SyncGroupRequest = %v\n", sreq)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	sanity_check(&sreq, partitioner, jreqs[:], all_topics, t)
+	return sanity_check(&sreq, partitioner, jreqs[:], t)
 }
 
 // sanity check a set of assignments for basic correctness
-func sanity_check(sreq *sarama.SyncGroupRequest, partitioner consumer.Partitioner, jreqs []sarama.JoinGroupRequest, topics []string, t *testing.T) {
+func sanity_check(sreq *sarama.SyncGroupRequest, partitioner consumer.Partitioner, jreqs []sarama.JoinGroupRequest, t *testing.T) assignments {
 
-	assignments := make(map[string]map[string][]int32) // map of member to topic to the assigned list of partitions
+	assignments := make(assignments)    // map of member to topic to the assigned list of partitions
+	topics := make(map[string]struct{}) // set of all topics in the response
+
 	for i := range jreqs {
 		id := jreqs[i].MemberId
 		var sresp = sarama.SyncGroupResponse{
@@ -83,9 +92,13 @@ func sanity_check(sreq *sarama.SyncGroupRequest, partitioner consumer.Partitione
 		t.Logf("%s assignment %v\n", id, act)
 
 		assignments[id] = act
+
+		for t := range act {
+			topics[t] = struct{}{}
+		}
 	}
 
-	for _, topic := range topics {
+	for topic := range topics {
 		low := 1 << 30
 		high := 0
 		used := make(map[int32]string)
@@ -114,6 +127,8 @@ func sanity_check(sreq *sarama.SyncGroupRequest, partitioner consumer.Partitione
 			t.Errorf("Partition assignment of topic %q is uneven. Some have %d and some have %d", topic, low, high)
 		}
 	}
+
+	return assignments
 }
 
 // mock sarama.Client which implements the metadata API sufficiently for our unit test purposes
