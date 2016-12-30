@@ -29,6 +29,7 @@ package stable
 
 import (
 	"fmt"
+	"log"
 	"sort"
 
 	"github.com/Shopify/sarama"
@@ -42,7 +43,7 @@ const Stable stablePartitioner = "stable"
 
 // print a debug message
 func dbgf(format string, args ...interface{}) {
-	fmt.Printf(format, args...)
+	log.Printf(format, args...)
 }
 
 func (sp stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string, current_assignments map[string][]int32) {
@@ -66,7 +67,7 @@ func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sara
 		return fmt.Errorf("sarama.JoinGroupResponse.GroupProtocol %q unexpected; expected %q", jresp.GroupProtocol != string(sp))
 	}
 	by_member, err := jresp.GetMembers() //  map of member to ConsumerGroupMemberMetadata
-	dbgf("by_member %v", by_member)
+	dbgf("by_member = %v", by_member)
 	if err != nil {
 		return err
 	}
@@ -95,7 +96,7 @@ func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sara
 			members[member] = data.assignments[topic] // NOTE: might be nil, which is OK. It just means the member wants to consume the partition but isn't doing so currently
 		}
 	}
-	dbgf("by_topic %v", by_topic)
+	dbgf("by_topic = %v", by_topic)
 
 	// lookup the partitions in each topic. since we are asking for all partitions, not just the online ones, the numbering
 	// appears to always be 0...N-1. But in case I don't understand kafka and there is some corner case where the numbering
@@ -116,6 +117,7 @@ func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sara
 		sort.Sort(pl)
 		partitions_by_topic[topic] = pl
 	}
+	dbgf("partitions_by_topic = %v", partitions_by_topic)
 
 	// and compute the sorted set of members of each topic
 	var members_by_topic = make(map[string]memberslist)
@@ -127,6 +129,7 @@ func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sara
 		sort.Sort(ml)
 		members_by_topic[topic] = ml
 	}
+	dbgf("members_by_topic = %v", members_by_topic)
 
 	// I want topics with the same # of partitions and the same consumer group membership to result in the same partition assignments.
 	// That way messages published under identical partition keys in those topics will all end up consumed by the same member.
@@ -145,6 +148,7 @@ func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sara
 			matched_topics[topic] = topic
 		}
 	}
+	dbgf("matched_topics = %v", matched_topics)
 
 	// adjust the partitioning of each master topic in by_topic
 	for topic, match := range matched_topics {
@@ -172,7 +176,7 @@ func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sara
 			topics[topic] = partitions
 		}
 	}
-	dbgf("assignments %v", assignments)
+	dbgf("assignments = %v", assignments)
 
 	// and encode the assignments in the sync request
 	for member, topics := range assignments {
@@ -206,13 +210,17 @@ func (stablePartitioner) ParseSync(sresp *sarama.SyncGroupResponse) (map[string]
 
 // adjust_partitioning does the main work. it adjusts the partition assignment map it is passed in-place
 func adjust_partitioning(assignment map[string][]int32, partitions partitionslist) {
+	dbgf("adjust_partitioning(assignment = %v, partitions = %v)", assignment, partitions)
 	num_members := len(assignment)
+	dbgf("num_members = %v", num_members)
 	if num_members == 0 {
 		// no one wants this topic; stop now before we /0
 		return
 	}
 	num_partitions := len(partitions)
+	dbgf("num_partitions = %v", num_partitions)
 	level := (num_partitions + num_members - 1) / num_members // the maximum # of partitions each member should receive
+	dbgf("level = %v", level)
 
 	unassigned := make(map[int32]struct{}) // set of unassigned partition ids
 
@@ -220,6 +228,7 @@ func adjust_partitioning(assignment map[string][]int32, partitions partitionslis
 	for _, p := range partitions {
 		unassigned[p] = struct{}{}
 	}
+	dbgf("unassigned = %v", unassigned)
 
 	// let each member keep up to 'level' of its current assignment
 	for m, a := range assignment {
@@ -231,6 +240,8 @@ func adjust_partitioning(assignment map[string][]int32, partitions partitionslis
 			delete(unassigned, p)
 		}
 	}
+	dbgf("assignment = %v", assignment)
+	dbgf("unassigned = %v", unassigned)
 
 	// assign the unassigned partitions to any member with < level partitions
 	for p := range unassigned {
@@ -245,6 +256,7 @@ func adjust_partitioning(assignment map[string][]int32, partitions partitionslis
 	}
 
 	// and we're done
+	dbgf("assignment = %v", assignment)
 }
 
 // ----------------------------------
