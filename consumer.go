@@ -245,7 +245,7 @@ type Partitioner interface {
 	// PrepareJoin prepares a JoinGroupRequest given the topics supplied.
 	// The simplest implementation would be something like
 	//   join_req.AddGroupProtocolMetadata("<partitioner name>", &sarama.ConsumerGroupMemberMetadata{ Version: 1, Topics:  topics, })
-	PrepareJoin(join_req *sarama.JoinGroupRequest, topics []string)
+	PrepareJoin(join_req *sarama.JoinGroupRequest, topics []string, current_assignments map[string][]int32)
 
 	// Partition performs the partitioning. Given the requested
 	// memberships from the JoinGroupResponse, it adds the results
@@ -337,6 +337,7 @@ func (cl *client) run(early_rc chan<- error) {
 
 	var member_id string                    // our group member id, assigned to us by kafka when we first make contact
 	consumers := make(map[string]*consumer) // map of topic -> consumer
+	var assignments map[string][]int32      // nil, or our currently assigned partitions (map of topic -> list of partitions)
 	var wg sync.WaitGroup                   // waitgroup used to wait for all consumers to exit
 
 	defer dbgf("consumer-group %q client exiting", cl.group_name)
@@ -361,6 +362,7 @@ func (cl *client) run(early_rc chan<- error) {
 		existing_con := consumers[con.topic]
 		if existing_con == con {
 			delete(consumers, con.topic)
+			delete(assignments, con.topic) // forget about the topic's partition assignment
 		} // else it's some old consumer and we've already removed it
 		// and let the consumer shutdown
 		close(con.assignments)
@@ -481,11 +483,17 @@ join_loop:
 			ProtocolType:   "consumer", // we implement the standard kafka 0.9 consumer protocol metadata
 		}
 
-		var topics = make([]string, 0, len(consumers))
-		for topic := range consumers {
-			topics = append(topics, topic)
+		{ // prepare the join request
+			var topics = make([]string, 0, len(consumers))
+			var current_assignments = make(map[string][]int32, len(consumers))
+			for topic := range consumers {
+				topics = append(topics, topic)
+				if a := assignments[topic]; a != nil && len(a) != 0 { // omit any topics for which we are not assigned a partition
+					current_assignments[topic] = a
+				}
+			}
+			cl.config.Partitioner.PrepareJoin(jreq, topics, current_assignments)
 		}
-		cl.config.Partitioner.PrepareJoin(jreq, topics)
 
 		dbgf("sending JoinGroupRequest %v", jreq)
 		jresp, err := coor.JoinGroup(jreq)
@@ -566,14 +574,15 @@ join_loop:
 			pause = true
 			continue join_loop
 		}
-		assignments, err := cl.config.Partitioner.ParseSync(sresp)
+		new_assignments, err := cl.config.Partitioner.ParseSync(sresp)
 		if err != nil {
 			cl.deliverError("decoding member assignments", err)
 			pause = true
 			continue join_loop
 		}
 
-		// keep track of how many partitions we are assigned
+		// keep track of which and how many partitions we are assigned
+		assignments = new_assignments
 		num_assigned_partitions := 0
 		for _, parts := range assignments {
 			num_assigned_partitions += len(parts)

@@ -22,7 +22,7 @@ type roundRobinPartitioner string
 // global instance of the round-robin partitioner
 const RoundRobin roundRobinPartitioner = "roundrobin" // use the string "roundrobin" without a dash to match what kafka java code uses, should someone want to mix go and java consumers in the same group
 
-func (rr roundRobinPartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string) {
+func (rr roundRobinPartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string, current map[string][]int32) {
 	jreq.AddGroupProtocolMetadata(string(rr),
 		&sarama.ConsumerGroupMemberMetadata{
 			Version: 1,

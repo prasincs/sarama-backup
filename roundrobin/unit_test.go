@@ -33,7 +33,7 @@ func TestRoundRobin(t *testing.T) {
 		jreqs[i].GroupId = "group"
 		jreqs[i].MemberId = fmt.Sprintf("member%d", i)
 		jreqs[i].ProtocolType = "consumer"
-		rr.PrepareJoin(&jreqs[i], []string{"topic1", "topic2"})
+		rr.PrepareJoin(&jreqs[i], []string{"topic1", "topic2"}, nil)
 
 		t.Logf("JoinGroupRequests[%d] = %v\n", i, jreqs[i])
 	}
