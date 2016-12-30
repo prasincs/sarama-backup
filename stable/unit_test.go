@@ -9,6 +9,7 @@ package stable_test
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/Shopify/sarama"
@@ -154,6 +155,72 @@ func TestUnstable(t *testing.T) {
 	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
 	t.Logf("preexisting = %v", pretty.Sprint(preexisting))
 	t.Logf("assignment = %v", pretty.Sprint(a))
+}
+
+// test behavior when clients have a preexisting assignments which should change together
+func TestConsistent(t *testing.T) {
+	var partitioner consumer.Partitioner = stable.Stable
+
+	topics := []string{"topic1", "topic2", "topic3", "topic4"}
+
+	var mock_client = mockClient{
+		config: sarama.NewConfig(),
+		partitions: map[string][]int32{
+			"topic1": []int32{0, 1, 2, 3},
+			"topic2": []int32{0, 1, 2, 3},
+			"topic3": []int32{0, 1, 2, 3},
+			"topic4": []int32{0, 1, 2, 3},
+		},
+	}
+
+	// pretend to have 3 members, with some preexisting assignments, asking for all the topics
+	var preexisting = assignments{
+		"member0": map[string][]int32{
+			"topic1": []int32{0, 7, 3, 4}, // too many partitions of topic1
+			"topic2": []int32{},
+			"topic3": []int32{5}, // partitions 1,3 and 4 are consumed by no one
+			"topic4": []int32{1},
+		},
+		"member1": map[string][]int32{
+			"topic1": []int32{1, 5},
+			"topic2": nil,
+			"topic3": []int32{2},
+			"topic4": []int32{2},
+		},
+		"member2": map[string][]int32{
+			"topic1": []int32{6},
+			"topic2": []int32{0, 1}, // must give up one partition
+			"topic3": []int32{0},
+			"topic4": []int32{0},
+		},
+	}
+
+	var jreqs [3]sarama.JoinGroupRequest
+	for i := range jreqs {
+		jreqs[i].GroupId = "group"
+		id := fmt.Sprintf("member%d", i)
+		jreqs[i].MemberId = id
+		jreqs[i].ProtocolType = "consumer"
+		partitioner.PrepareJoin(&jreqs[i], topics, preexisting[id])
+	}
+
+	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	t.Logf("preexisting = %v", pretty.Sprint(preexisting))
+	t.Logf("assignment = %v", pretty.Sprint(a))
+
+	// verify the assignments are consistent across topics
+	for m, aa := range a {
+		var prev *partitionslist
+		for topic, p := range aa {
+			pp := partitionslist(p)
+			sort.Sort(pp)
+			if prev == nil {
+				prev = &pp
+			} else if !pp.Equal(*prev) {
+				t.Errorf("inconsistent partition assignments in topic %q for member %q: %v and %v", topic, m, pp, *prev)
+			}
+		}
+	}
 }
 
 // test behavior when clients have a preexisting assignment which overlap
@@ -410,4 +477,25 @@ func (mc *mockClient) Close() error {
 
 func (mc *mockClient) Closed() bool {
 	return false
+}
+
+// a sortable, comparible list of partition ids
+type partitionslist []int32 // a list of the partition ids
+
+// implement sort.Interface
+func (pl partitionslist) Len() int           { return len(pl) }
+func (pl partitionslist) Swap(i, j int)      { pl[i], pl[j] = pl[j], pl[i] }
+func (pl partitionslist) Less(i, j int) bool { return pl[i] < pl[j] }
+
+// and compare two sorted partitionslist for equality
+func (pl partitionslist) Equal(pl2 partitionslist) bool {
+	if len(pl) != len(pl2) {
+		return false
+	}
+	for i, m := range pl {
+		if m != pl2[i] {
+			return false
+		}
+	}
+	return true
 }

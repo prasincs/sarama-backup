@@ -29,7 +29,6 @@ package stable
 
 import (
 	"fmt"
-	"log"
 	"sort"
 
 	"github.com/Shopify/sarama"
@@ -43,7 +42,7 @@ const Stable stablePartitioner = "stable"
 
 // print a debug message
 func dbgf(format string, args ...interface{}) {
-	log.Printf(format, args...)
+	//log.Printf(format, args...)
 }
 
 func (sp stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string, current_assignments map[string][]int32) {
