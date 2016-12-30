@@ -220,8 +220,9 @@ func adjust_partitioning(assignment map[string][]int32, partitions partitionslis
 	}
 	num_partitions := len(partitions)
 	dbgf("num_partitions = %v", num_partitions)
-	level := (num_partitions + num_members - 1) / num_members // the maximum # of partitions each member should receive
-	dbgf("level = %v", level)
+	low := num_partitions / num_members                      // the minimum # of partitions each member should receive
+	high := (num_partitions + num_members - 1) / num_members // the maximum # of partitions each member should receive
+	dbgf("low = %v, high = %v", low, high)
 
 	unassigned := make(map[int32]struct{}) // set of unassigned partition ids
 
@@ -231,10 +232,10 @@ func adjust_partitioning(assignment map[string][]int32, partitions partitionslis
 	}
 	dbgf("unassigned = %v", unassigned)
 
-	// let each member keep up to 'level' of its current assignment
+	// let each member keep up to 'high' of its current assignment
 	for m, a := range assignment {
-		if len(a) > level {
-			a = a[:level]
+		if len(a) > high {
+			a = a[:high]
 			assignment[m] = a
 		}
 		for _, p := range a {
@@ -244,17 +245,53 @@ func adjust_partitioning(assignment map[string][]int32, partitions partitionslis
 	dbgf("assignment = %v", assignment)
 	dbgf("unassigned = %v", unassigned)
 
-	// assign the unassigned partitions to any member with < level partitions
+	// assign the unassigned partitions to any member with < low partitions
+	for p := range unassigned {
+	unassigned_loop:
+		for m, a := range assignment {
+			if len(a) < low {
+				a = append(a, p)
+				assignment[m] = a
+				delete(unassigned, p)
+				break unassigned_loop
+			}
+		}
+	}
+	dbgf("assignment = %v", assignment)
+	dbgf("unassigned = %v", unassigned)
+
+	// take partitions from any member with > low partitions to give
+	// to any member with < low partitions
+	for m, a := range assignment {
+	stealing_from_the_numerous:
+		for len(a) < low {
+			for m2, a2 := range assignment {
+				n := len(a2)
+				if n > low {
+					// take the last partition from m2 and give it to m
+					assignment[m2] = a2[:n-1]
+					a = append(a, a2[n-1])
+					assignment[m] = a
+					continue stealing_from_the_numerous
+				}
+			}
+		}
+	}
+
+	// and finally assign any remaining unassigned partitions to any member with < high partitions
 	for p := range unassigned {
 	assignment_loop:
 		for m, a := range assignment {
-			if len(a) < level {
+			if len(a) < high {
 				a = append(a, p)
 				assignment[m] = a
+				delete(unassigned, p) // not really necessary, since we don't reuse unassigned afterwards
 				break assignment_loop
 			}
 		}
 	}
+	dbgf("assignment = %v", assignment)
+	dbgf("unassigned = %v", unassigned)
 
 	// and we're done
 	dbgf("assignment = %v", assignment)
