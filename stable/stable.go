@@ -135,18 +135,19 @@ func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sara
 	// That way messages published under identical partition keys in those topics will all end up consumed by the same member.
 	// So organize topics into groups which will be partitioned identically
 	var matched_topics = make(map[string]string) // map from each topic to the 'master' topic with the same # of partitions and group membership. Topics which are unique are their own master
+topic_match_loop:
 	for topic, members := range members_by_topic {
 		// see if a match exists
 		num_partitions := len(partitions_by_topic[topic])
 		for t := range matched_topics { // TODO if # of topics gets large enough this shows up in the profiler, change this to some sort of a map lookup, rather than this O(N^2) search
 			if num_partitions == len(partitions_by_topic[t]) && members.Equal(members_by_topic[t]) {
-				// match; have topic 'topic' be partitioned the same as topic 't'
+				// match; have topic 'topic' be partitioned the same way as topic 't'
 				matched_topics[topic] = matched_topics[t]
-				continue
+				continue topic_match_loop
 			}
-			// no existing topic matches this one, so it is its own match
-			matched_topics[topic] = topic
 		}
+		// no existing topic matches this one, so it is its own match
+		matched_topics[topic] = topic
 	}
 	dbgf("matched_topics = %v", matched_topics)
 
