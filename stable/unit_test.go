@@ -16,7 +16,7 @@ import (
 )
 
 func TestGreenfield(t *testing.T) {
-	var rr consumer.Partitioner = stable.Stable
+	var partitioner consumer.Partitioner = stable.Stable
 
 	all_topics := []string{"topic1", "topic2", "topic3", "topic4"}
 
@@ -36,7 +36,7 @@ func TestGreenfield(t *testing.T) {
 		jreqs[i].GroupId = "group"
 		jreqs[i].MemberId = fmt.Sprintf("member%d", i)
 		jreqs[i].ProtocolType = "consumer"
-		rr.PrepareJoin(&jreqs[i], all_topics, nil)
+		partitioner.PrepareJoin(&jreqs[i], all_topics, nil)
 
 		t.Logf("JoinGroupRequests[%d] = %v\n", i, jreqs[i])
 	}
@@ -56,11 +56,17 @@ func TestGreenfield(t *testing.T) {
 		GenerationId: 1,
 		MemberId:     "member0",
 	}
-	err := rr.Partition(&sreq, &jresp, &mock_client)
+	err := partitioner.Partition(&sreq, &jresp, &mock_client)
 	t.Logf("SyncGroupRequest = %v\n", sreq)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	sanity_check(&sreq, partitioner, jreqs[:], all_topics, t)
+}
+
+// sanity check a set of assignments for basic correctness
+func sanity_check(sreq *sarama.SyncGroupRequest, partitioner consumer.Partitioner, jreqs []sarama.JoinGroupRequest, topics []string, t *testing.T) {
 
 	assignments := make(map[string]map[string][]int32) // map of member to topic to the assigned list of partitions
 	for i := range jreqs {
@@ -69,9 +75,9 @@ func TestGreenfield(t *testing.T) {
 			MemberAssignment: sreq.GroupAssignments[id],
 		}
 
-		act, err := rr.ParseSync(&sresp)
+		act, err := partitioner.ParseSync(&sresp)
 		if err != nil {
-			t.Fatal(err)
+			t.Errorf("failed to parse SyncGroupRespons data: %v", err)
 		}
 
 		t.Logf("%s assignment %v\n", id, act)
@@ -79,7 +85,7 @@ func TestGreenfield(t *testing.T) {
 		assignments[id] = act
 	}
 
-	for _, topic := range all_topics {
+	for _, topic := range topics {
 		low := 1 << 30
 		high := 0
 		used := make(map[int32]string)
