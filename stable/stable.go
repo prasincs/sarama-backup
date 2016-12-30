@@ -224,13 +224,47 @@ func adjust_partitioning(assignment map[string][]int32, partitions partitionslis
 	high := (num_partitions + num_members - 1) / num_members // the maximum # of partitions each member should receive
 	dbgf("low = %v, high = %v", low, high)
 
-	unassigned := make(map[int32]struct{}) // set of unassigned partition ids
+	unassigned := make(map[int32]struct{}, len(partitions)) // set of unassigned partition ids
+	claimed := make(map[int32]struct{}, len(partitions))    // set of initially claimed partition ids
 
 	// initially all partitions are unassigned
 	for _, p := range partitions {
 		unassigned[p] = struct{}{}
 	}
 	dbgf("unassigned = %v", unassigned)
+
+	// remove from each member's claim any partitions which do not exist
+	// and any partitions which are already claimed by another member.
+	// (these will happen only in corner cases where kafka is reconfigured,
+	// or clients are confused/out of sync, but it is always a good idea
+	// to check this for sanity before proceeding further)
+	for m, a := range assignment {
+		for _, p := range a {
+			_, ok := unassigned[p]
+			_, ok2 := claimed[p]
+			if !ok || ok2 {
+				// partition p no longer exists, or already is claimed; we need to filter this member's assignment carefully
+				if ok2 {
+					dbgf("partition %d claimed by %q is already claimed ", p, m)
+				} else {
+					dbgf("partition %d claimed by %q no longer exists", p, m)
+				}
+				a2 := make([]int32, 0, len(a)-1)
+				for _, p := range a {
+					_, ok := unassigned[p]
+					_, ok2 := claimed[p]
+					if ok && !ok2 {
+						a2 = append(a2, p)
+						claimed[p] = struct{}{}
+					}
+				}
+				assignment[m] = a2
+				break
+			}
+			claimed[p] = struct{}{}
+		}
+	}
+	dbgf("assignment = %v", assignment)
 
 	// let each member keep up to 'high' of its current assignment
 	for m, a := range assignment {

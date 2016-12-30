@@ -8,19 +8,238 @@ package stable_test
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/Shopify/sarama"
+	"github.com/kr/pretty"
 	consumer "github.com/mistsys/sarama-consumer"
 	"github.com/mistsys/sarama-consumer/stable"
 )
 
 type assignments map[string]map[string][]int32 // map of member to topic to the assigned list of partitions
 
+// test behavior when clients have no preexisting state
 func TestGreenfield(t *testing.T) {
 	var partitioner consumer.Partitioner = stable.Stable
 
 	topics := []string{"topic1", "topic2", "topic3", "topic4"}
+
+	var mock_client = mockClient{
+		config: sarama.NewConfig(),
+		partitions: map[string][]int32{
+			"topic1": []int32{0, 1 /*,no 2*/, 3, 4, 5, 6, 7}, // note we pretend partition 2 is offline
+			"topic2": []int32{0, 1},
+			"topic3": []int32{0, 1, 2, 3, 4, 5}, // exactly 2 partitions per member
+			"topic4": []int32{0, 1, 2},          // exactly 1 partitions per member
+		},
+	}
+
+	// pretend to have 3 members, with no current assignments, asking for all the topics
+	var jreqs [3]sarama.JoinGroupRequest
+	for i := range jreqs {
+		jreqs[i].GroupId = "group"
+		jreqs[i].MemberId = fmt.Sprintf("member%d", i)
+		jreqs[i].ProtocolType = "consumer"
+		partitioner.PrepareJoin(&jreqs[i], topics, nil)
+	}
+
+	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	t.Logf("assignment = %v", pretty.Sprint(a))
+}
+
+// test behavior when clients have a preexisting assignment which should not change at all
+func TestStable(t *testing.T) {
+	var partitioner consumer.Partitioner = stable.Stable
+
+	topics := []string{"topic1", "topic2", "topic3", "topic4"}
+
+	var mock_client = mockClient{
+		config: sarama.NewConfig(),
+		partitions: map[string][]int32{
+			"topic1": []int32{0, 1 /*,no 2*/, 3, 4, 5, 6, 7}, // note we pretend partition 2 is offline
+			"topic2": []int32{0, 1},
+			"topic3": []int32{0, 1, 2, 3, 4, 5}, // exactly 2 partitions per member
+			"topic4": []int32{0, 1, 2},          // exactly 1 partitions per member
+		},
+	}
+
+	// pretend to have 3 members, with some preexisting assignments, asking for all the topics
+	var preexisting = assignments{
+		"member0": map[string][]int32{
+			"topic1": []int32{0, 4},
+			"topic2": []int32{1},
+			"topic3": []int32{4, 5},
+			"topic4": []int32{1},
+		},
+		"member1": map[string][]int32{
+			"topic1": []int32{1, 5, 7},
+			"topic2": nil,
+			"topic3": []int32{3, 2},
+			"topic4": []int32{2},
+		},
+		"member2": map[string][]int32{
+			"topic1": []int32{3, 6},
+			"topic2": []int32{0},
+			"topic3": []int32{1, 0},
+			"topic4": []int32{0},
+		},
+	}
+
+	var jreqs [3]sarama.JoinGroupRequest
+	for i := range jreqs {
+		jreqs[i].GroupId = "group"
+		id := fmt.Sprintf("member%d", i)
+		jreqs[i].MemberId = id
+		jreqs[i].ProtocolType = "consumer"
+		partitioner.PrepareJoin(&jreqs[i], topics, preexisting[id])
+	}
+
+	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	t.Logf("preexisting = %v", pretty.Sprint(preexisting))
+	t.Logf("assignment = %v", pretty.Sprint(a))
+
+	if !reflect.DeepEqual(preexisting, a) {
+		t.Error("partitioning altered stable assignment")
+	}
+}
+
+// test behavior when clients have a preexisting assignment which should change
+func TestUnstable(t *testing.T) {
+	var partitioner consumer.Partitioner = stable.Stable
+
+	topics := []string{"topic1", "topic2", "topic3", "topic4"}
+
+	var mock_client = mockClient{
+		config: sarama.NewConfig(),
+		partitions: map[string][]int32{
+			"topic1": []int32{0, 1 /*,no 2*/, 3, 4, 5, 6, 7}, // note we pretend partition 2 is offline
+			"topic2": []int32{0, 1},
+			"topic3": []int32{0, 1, 2, 3, 4, 5}, // exactly 2 partitions per member
+			"topic4": []int32{0, 1, 2},          // exactly 1 partitions per member
+		},
+	}
+
+	// pretend to have 3 members, with some preexisting assignments, asking for all the topics
+	var preexisting = assignments{
+		"member0": map[string][]int32{
+			"topic1": []int32{0, 7, 3, 4}, // too many partitions of topic1
+			"topic2": []int32{},
+			"topic3": []int32{5}, // partitions 1,3 and 4 are consumed by no one
+			"topic4": []int32{1},
+		},
+		"member1": map[string][]int32{
+			"topic1": []int32{1, 5},
+			"topic2": nil,
+			"topic3": []int32{2},
+			"topic4": []int32{2},
+		},
+		"member2": map[string][]int32{
+			"topic1": []int32{6},
+			"topic2": []int32{0, 1}, // must give up one partition
+			"topic3": []int32{0},
+			"topic4": []int32{0},
+		},
+	}
+
+	var jreqs [3]sarama.JoinGroupRequest
+	for i := range jreqs {
+		jreqs[i].GroupId = "group"
+		id := fmt.Sprintf("member%d", i)
+		jreqs[i].MemberId = id
+		jreqs[i].ProtocolType = "consumer"
+		partitioner.PrepareJoin(&jreqs[i], topics, preexisting[id])
+	}
+
+	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	t.Logf("preexisting = %v", pretty.Sprint(preexisting))
+	t.Logf("assignment = %v", pretty.Sprint(a))
+}
+
+// test behavior when clients have a preexisting assignment which overlap
+func TestFalseClaims(t *testing.T) {
+	var partitioner consumer.Partitioner = stable.Stable
+
+	topics := []string{"topic1", "topic2", "topic3", "topic4"}
+
+	var mock_client = mockClient{
+		config: sarama.NewConfig(),
+		partitions: map[string][]int32{
+			"topic1": []int32{0, 1 /*,no 2*/, 3, 4, 5, 6, 7}, // note we pretend partition 2 is offline
+			"topic2": []int32{0, 1},
+			"topic3": []int32{0, 1, 2, 3, 4, 5}, // exactly 2 partitions per member
+			"topic4": []int32{0, 1, 2},          // exactly 1 partitions per member
+		},
+	}
+
+	// pretend to have 3 members, with some preexisting assignments, asking for all the topics
+	var preexisting = assignments{
+		"member0": map[string][]int32{
+			"topic1": []int32{0, 1, 2, 6, 7, 3, 4}, // claim non-existant partition 2, as well as 1 and 6 which other clients claim too
+			"topic2": []int32{0, 1},                // everyone claims all the partitions
+			"topic3": []int32{5, 99},               // partition 99 does not exist; partitions 1,3 and 4 are consumed by no one
+			"topic4": []int32{1, 2},                // more overlapping claims:
+		},
+		"member1": map[string][]int32{
+			"topic1": []int32{1, 5},
+			"topic2": []int32{0, 1},
+			"topic3": []int32{2},
+			"topic4": []int32{2, 0},
+		},
+		"member2": map[string][]int32{
+			"topic1": []int32{6},
+			"topic2": []int32{0, 1}, // must give up one partition
+			"topic3": []int32{0},
+			"topic4": []int32{0, 1},
+		},
+	}
+
+	var jreqs [3]sarama.JoinGroupRequest
+	for i := range jreqs {
+		jreqs[i].GroupId = "group"
+		id := fmt.Sprintf("member%d", i)
+		jreqs[i].MemberId = id
+		jreqs[i].ProtocolType = "consumer"
+		partitioner.PrepareJoin(&jreqs[i], topics, preexisting[id])
+	}
+
+	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	t.Logf("preexisting = %v", pretty.Sprint(preexisting))
+	t.Logf("assignment = %v", pretty.Sprint(a))
+}
+
+// test behavior when there are no partitions
+func TestNoPartitions(t *testing.T) {
+	var partitioner consumer.Partitioner = stable.Stable
+
+	topics := []string{"topic1", "topic2"}
+
+	var mock_client = mockClient{
+		config: sarama.NewConfig(),
+		partitions: map[string][]int32{
+			"topic1": []int32{}, // no partitions at all
+			"topic2": []int32{},
+		},
+	}
+
+	// pretend to have 3 members, with no current assignments, asking for all the topics
+	var jreqs [3]sarama.JoinGroupRequest
+	for i := range jreqs {
+		jreqs[i].GroupId = "group"
+		jreqs[i].MemberId = fmt.Sprintf("member%d", i)
+		jreqs[i].ProtocolType = "consumer"
+		partitioner.PrepareJoin(&jreqs[i], topics, nil)
+	}
+
+	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	t.Logf("assignment = %v", pretty.Sprint(a))
+}
+
+// test behavior when clients request no topics at all
+func TestNoTopics(t *testing.T) {
+	var partitioner consumer.Partitioner = stable.Stable
+
+	no_topics := []string{}
 
 	var mock_client = mockClient{
 		config: sarama.NewConfig(),
@@ -38,13 +257,14 @@ func TestGreenfield(t *testing.T) {
 		jreqs[i].GroupId = "group"
 		jreqs[i].MemberId = fmt.Sprintf("member%d", i)
 		jreqs[i].ProtocolType = "consumer"
-		partitioner.PrepareJoin(&jreqs[i], topics, nil)
-
-		t.Logf("JoinGroupRequests[%d] = %v\n", i, jreqs[i])
+		partitioner.PrepareJoin(&jreqs[i], no_topics, nil)
 	}
 
-	join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	t.Logf("assignment = %v", pretty.Sprint(a))
 }
+
+//-------------------------------------------------------------------------------------------------------
 
 // join and sync and sanity check and return the resulting assignment
 func join_and_sync(jreqs []sarama.JoinGroupRequest, partitioner consumer.Partitioner, client sarama.Client, t *testing.T) assignments {
@@ -56,7 +276,7 @@ func join_and_sync(jreqs []sarama.JoinGroupRequest, partitioner consumer.Partiti
 	for i := range jreqs {
 		jresp.Members[jreqs[i].MemberId] = jreqs[i].GroupProtocols[string(stable.Stable)]
 	}
-	t.Logf("JoinGroupResponse = %v\n", jresp)
+	//t.Logf("JoinGroupResponse = %v\n", jresp)
 
 	var sreq = sarama.SyncGroupRequest{
 		GroupId:      "group",
@@ -64,7 +284,7 @@ func join_and_sync(jreqs []sarama.JoinGroupRequest, partitioner consumer.Partiti
 		MemberId:     "member0",
 	}
 	err := partitioner.Partition(&sreq, &jresp, client)
-	t.Logf("SyncGroupRequest = %v\n", sreq)
+	//t.Logf("SyncGroupRequest = %v\n", sreq)
 	if err != nil {
 		t.Fatal(err)
 	}
