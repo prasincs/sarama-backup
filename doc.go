@@ -7,6 +7,7 @@ and restart at the last comitted offset of each partition.
 This requires Kafka v0.9+ and follows the steps guide, described in:
 https://cwiki.apache.org/confluence/display/KAFKA/Kafka+Client-side+Assignment+Proposal
 
+
 CONFIGURATION
 
 Three customization APIs may be set in the Config:
@@ -22,11 +23,25 @@ the committed offset, or at sarama.Config.Consumer.Offsets.Initial if the starti
 (indicating no committed offset could be found).
 
 Config.Partitioner interface allows users to control how the consumer group distributes partitions
-across the group members. The default is to distribute the partitions of each topic round-robin across
-the members. However a custom partitioner may want to use a more stable hash to prevent disturbing
-so many mappings. And since all topics are partitioned at once, a custom Partitioner can assign matching
-partitions from different topics to the same consumer (useful when two topics are keyed identically and
-the same key in either topic should arrive at the same consumer).
+across the group members. The default is to distribute the partitions of each topic in a round-robin
+fashion across the available members. This is good for basic load balancing. Round-robin is no good
+if it is desireable that the partitions stay at the same consumer during repartitioning.
+
+A stable partitioner is provided by the stable package. It keeps the partition->consumer mapping
+stable as best it can. When one consumer restart quickly enough (within the kafka consumer heartbeat
+timeout) the partition mapping of the rest of the consumers is not altered. When consumers are
+added to the group only a minimum number of partitions are reassigned from existing consumers to
+the new consumers.
+
+Using the stable partition means setting
+
+  Config.Partitioner = stable.New(false)
+
+Passing true to stable.New() returns a stable & consistent consumer. See the documentation.
+
+More complex partitioners, for example one which did some sort of weighted balancing, are yours
+to implement.
+
 
 PHILOSOPHY
 

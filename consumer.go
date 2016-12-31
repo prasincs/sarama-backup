@@ -76,7 +76,7 @@ func (err *Error) Error() string {
 //
 // In addition to this config, consumer's code also looks at the sarama.Config of the sarama.Client
 // supplied to NewClient, especially at the Consumer.Offsets settings, Version, Metadata.Retry.Backoff
-// and [TODO] ChannelBufferSize.
+// and ChannelBufferSize.
 type Config struct {
 	Session struct {
 		// The allowed session timeout for registered consumers (defaults to 30s).
