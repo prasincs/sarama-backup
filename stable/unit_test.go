@@ -337,11 +337,11 @@ func TestNoTopics(t *testing.T) {
 func join_and_sync(jreqs []sarama.JoinGroupRequest, partitioner consumer.Partitioner, client sarama.Client, t *testing.T) assignments {
 	var jresp = sarama.JoinGroupResponse{
 		GenerationId:  1,
-		GroupProtocol: string(stable.Stable),
+		GroupProtocol: stable.Name,
 		Members:       make(map[string][]byte),
 	}
 	for i := range jreqs {
-		jresp.Members[jreqs[i].MemberId] = jreqs[i].GroupProtocols[string(stable.Stable)]
+		jresp.Members[jreqs[i].MemberId] = jreqs[i].GroupProtocols[stable.Name]
 	}
 	//t.Logf("JoinGroupResponse = %v\n", jresp)
 

@@ -35,10 +35,12 @@ import (
 )
 
 // a partitioner that assigns partitions to consumers such that as consumers come and go the least number of partitions are reassigned
-type stablePartitioner string
+type stablePartitioner struct{}
 
-// global instance of the stable partitioner
-const Stable stablePartitioner = "stable"
+var Stable stablePartitioner
+
+// the name of this partitioner's group protocol (all consumers in the group must agree on this, and it must not collide with other names)
+const Name = "stable&consistent"
 
 // print a debug message
 func dbgf(format string, args ...interface{}) {
@@ -52,7 +54,7 @@ func (sp stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []
 		assignments: current_assignments,
 	}
 
-	jreq.AddGroupProtocolMetadata(string(sp),
+	jreq.AddGroupProtocolMetadata(Name,
 		&sarama.ConsumerGroupMemberMetadata{
 			Version:  1,
 			Topics:   topics,
@@ -62,8 +64,8 @@ func (sp stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []
 
 // for each topic in jresp, assign the topic's partitions to the members requesting the topic
 func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
-	if jresp.GroupProtocol != string(sp) {
-		return fmt.Errorf("sarama.JoinGroupResponse.GroupProtocol %q unexpected; expected %q", jresp.GroupProtocol != string(sp))
+	if jresp.GroupProtocol != Name {
+		return fmt.Errorf("sarama.JoinGroupResponse.GroupProtocol %q unexpected; expected %q", jresp.GroupProtocol, Name)
 	}
 	by_member, err := jresp.GetMembers() //  map of member to ConsumerGroupMemberMetadata
 	dbgf("by_member = %v", by_member)
