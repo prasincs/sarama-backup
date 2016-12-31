@@ -22,6 +22,20 @@
   the history of the consumer group memberships from the time when
   there was 1 consumer until time T.
 
+  Optionally the partitioner can be consistent across matching topics,
+  so that the same partition in the matching topics is assigned to the
+  same consumer.
+
+  NOTE: the determination of "matching topics" is done by the heuristic
+  that any topic with the same number of partitions and same set of
+  consumers is matched. This is going to match more topics than necessary.
+  So far this extra matching hasn't hurt. If it does then the exactly
+  set of matching topics needs to be provided by each clients, and
+  the partitioner needs to merge each client's matches to determine
+  the actual set of matched topics. (This is necessary so that during
+  upgrades, when the set of matched topics is inconsistent across clients,
+  the partitioning is correct for everyone)
+
   Copyright 2016 MistSys
 */
 
@@ -35,9 +49,18 @@ import (
 )
 
 // a partitioner that assigns partitions to consumers such that as consumers come and go the least number of partitions are reassigned
-type stablePartitioner struct{}
+type stablePartitioner struct {
+	consistent bool
+}
 
-var Stable stablePartitioner
+// New constructs a new stable partitioner.
+// If consistent is true then the partitioning is consistent for all topics which have the same consumers and the same # of partitions.
+// Otherwise each topic is partitioned independantly.
+func New(consistent bool) *stablePartitioner {
+	return &stablePartitioner{
+		consistent: consistent,
+	}
+}
 
 // the name of this partitioner's group protocol (all consumers in the group must agree on this, and it must not collide with other names)
 const Name = "stable&consistent"
@@ -47,7 +70,7 @@ func dbgf(format string, args ...interface{}) {
 	//log.Printf(format, args...)
 }
 
-func (sp stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string, current_assignments map[string][]int32) {
+func (*stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string, current_assignments map[string][]int32) {
 	// encode the current assignments in a manner proprietary to this partitioner
 	var data = data{
 		version:     1,
@@ -63,7 +86,7 @@ func (sp stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []
 }
 
 // for each topic in jresp, assign the topic's partitions to the members requesting the topic
-func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
+func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
 	if jresp.GroupProtocol != Name {
 		return fmt.Errorf("sarama.JoinGroupResponse.GroupProtocol %q unexpected; expected %q", jresp.GroupProtocol, Name)
 	}
@@ -132,37 +155,44 @@ func (sp stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sara
 	}
 	dbgf("members_by_topic = %v", members_by_topic)
 
-	// I want topics with the same # of partitions and the same consumer group membership to result in the same partition assignments.
-	// That way messages published under identical partition keys in those topics will all end up consumed by the same member.
-	// So organize topics into groups which will be partitioned identically
-	var matched_topics = make(map[string]string) // map from each topic to the 'master' topic with the same # of partitions and group membership. Topics which are unique are their own master
-topic_match_loop:
-	for topic, members := range members_by_topic {
-		// see if a match exists
-		num_partitions := len(partitions_by_topic[topic])
-		for t := range matched_topics { // TODO if # of topics gets large enough this shows up in the profiler, change this to some sort of a map lookup, rather than this O(N^2) search
-			if num_partitions == len(partitions_by_topic[t]) && members.Equal(members_by_topic[t]) {
-				// match; have topic 'topic' be partitioned the same way as topic 't'
-				matched_topics[topic] = matched_topics[t]
-				continue topic_match_loop
+	if sp.consistent {
+		// I want topics with the same # of partitions and the same consumer group membership to result in the same partition assignments.
+		// That way messages published under identical partition keys in those topics will all end up consumed by the same member.
+		// So organize topics into groups which will be partitioned identically
+		var matched_topics = make(map[string]string) // map from each topic to the 'master' topic with the same # of partitions and group membership. Topics which are unique are their own master
+	topic_match_loop:
+		for topic, members := range members_by_topic {
+			// see if a match exists
+			num_partitions := len(partitions_by_topic[topic])
+			for t := range matched_topics { // TODO if # of topics gets large enough this shows up in the profiler, change this to some sort of a map lookup, rather than this O(N^2) search
+				if num_partitions == len(partitions_by_topic[t]) && members.Equal(members_by_topic[t]) {
+					// match; have topic 'topic' be partitioned the same way as topic 't'
+					matched_topics[topic] = matched_topics[t]
+					continue topic_match_loop
+				}
+			}
+			// no existing topic matches this one, so it is its own match
+			matched_topics[topic] = topic
+		}
+		dbgf("matched_topics = %v", matched_topics)
+
+		// adjust the partitioning of each master topic in by_topic
+		for topic, match := range matched_topics {
+			if topic == match {
+				adjust_partitioning(by_topic[topic], partitions_by_topic[topic])
+			} // else it is not a master topic. once the master has been partitioned we'll simply copy the result
+		}
+
+		// set matched topics to the same assignment as their master
+		for topic, match := range matched_topics {
+			if topic != match {
+				by_topic[topic] = by_topic[match]
 			}
 		}
-		// no existing topic matches this one, so it is its own match
-		matched_topics[topic] = topic
-	}
-	dbgf("matched_topics = %v", matched_topics)
-
-	// adjust the partitioning of each master topic in by_topic
-	for topic, match := range matched_topics {
-		if topic == match {
-			adjust_partitioning(by_topic[topic], partitions_by_topic[topic])
-		} // else it is not a master topic. once the master has been partitioned we'll simply copy the result
-	}
-
-	// set matched topics to the same assignment as their master
-	for topic, match := range matched_topics {
-		if topic != match {
-			by_topic[topic] = by_topic[match]
+	} else {
+		// partition each topic independantly
+		for topic, members := range by_topic {
+			adjust_partitioning(members, partitions_by_topic[topic])
 		}
 	}
 
@@ -192,7 +222,7 @@ topic_match_loop:
 	return nil
 }
 
-func (stablePartitioner) ParseSync(sresp *sarama.SyncGroupResponse) (map[string][]int32, error) {
+func (*stablePartitioner) ParseSync(sresp *sarama.SyncGroupResponse) (map[string][]int32, error) {
 	if len(sresp.MemberAssignment) == 0 {
 		// in the corner case that we ask for no topics, we get nothing back. However sarama fd498173ae2bf (head of master branch Nov 6th 2016) will return a useless error if we call sresp.GetMemberAssignment() in this case
 		return nil, nil

@@ -22,7 +22,7 @@ type assignments map[string]map[string][]int32 // map of member to topic to the 
 
 // test behavior when clients have no preexisting state
 func TestGreenfield(t *testing.T) {
-	var partitioner consumer.Partitioner = stable.Stable
+	var partitioner consumer.Partitioner = stable.New(false)
 
 	topics := []string{"topic1", "topic2", "topic3", "topic4"}
 
@@ -51,7 +51,7 @@ func TestGreenfield(t *testing.T) {
 
 // test behavior when clients have a preexisting assignment which should not change at all
 func TestStable(t *testing.T) {
-	var partitioner consumer.Partitioner = stable.Stable
+	var partitioner consumer.Partitioner = stable.New(false)
 
 	topics := []string{"topic1", "topic2", "topic3", "topic4"}
 
@@ -107,7 +107,7 @@ func TestStable(t *testing.T) {
 
 // test behavior when clients have a preexisting assignment which should change
 func TestUnstable(t *testing.T) {
-	var partitioner consumer.Partitioner = stable.Stable
+	var partitioner consumer.Partitioner = stable.New(false)
 
 	topics := []string{"topic1", "topic2", "topic3", "topic4"}
 
@@ -159,7 +159,7 @@ func TestUnstable(t *testing.T) {
 
 // test behavior when clients have a preexisting assignments which should change together
 func TestConsistent(t *testing.T) {
-	var partitioner consumer.Partitioner = stable.Stable
+	var partitioner consumer.Partitioner = stable.New(true)
 
 	topics := []string{"topic1", "topic2", "topic3", "topic4"}
 
@@ -225,7 +225,7 @@ func TestConsistent(t *testing.T) {
 
 // test behavior when clients have a preexisting assignment which overlap
 func TestFalseClaims(t *testing.T) {
-	var partitioner consumer.Partitioner = stable.Stable
+	var partitioner consumer.Partitioner = stable.New(false)
 
 	topics := []string{"topic1", "topic2", "topic3", "topic4"}
 
@@ -277,7 +277,7 @@ func TestFalseClaims(t *testing.T) {
 
 // test behavior when there are no partitions
 func TestNoPartitions(t *testing.T) {
-	var partitioner consumer.Partitioner = stable.Stable
+	var partitioner consumer.Partitioner = stable.New(false)
 
 	topics := []string{"topic1", "topic2"}
 
@@ -304,7 +304,7 @@ func TestNoPartitions(t *testing.T) {
 
 // test behavior when clients request no topics at all
 func TestNoTopics(t *testing.T) {
-	var partitioner consumer.Partitioner = stable.Stable
+	var partitioner consumer.Partitioner = stable.New(false)
 
 	no_topics := []string{}
 
