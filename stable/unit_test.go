@@ -8,7 +8,6 @@ package stable_test
 
 import (
 	"fmt"
-	"reflect"
 	"sort"
 	"testing"
 
@@ -19,6 +18,64 @@ import (
 )
 
 type assignments map[string]map[string][]int32 // map of member to topic to the assigned list of partitions
+
+// compare two assignments for logical equality. returns bool and a reason why
+func (a assignments) Equal(b assignments) (bool, string) {
+	// both must have the same per-topic data, but nil and {} are equivalent,
+	// and the order of the partitions doesn't matter
+
+	for member, topics := range a {
+		if b_topics, ok := b[member]; ok {
+			// compare each topic's assignments
+
+			// first divide the topics into those with an empty list of partitions and those with a non-empty list
+			var nonempty, empty []string
+			for t, p := range topics {
+				if len(p) != 0 {
+					nonempty = append(nonempty, t)
+				} else {
+					empty = append(empty, t)
+				}
+			}
+
+			// for each empty topic, check that b_topics is also empty. Note that nil and int32{} and missing entirely are treated as equivalently empty
+			for _, t := range empty {
+				if p, ok := b_topics[t]; ok {
+					if len(p) != 0 {
+						return false, fmt.Sprintf("member %q, topic %q mismatch", member, t)
+					}
+				} // else missing == empty assignment list
+			}
+
+			// for each non-empty topic, check that the partitions assigned match after sorting
+			for _, t := range nonempty {
+				pa := topics[t]
+				if pb, ok := b_topics[t]; ok {
+					pla := make(partitionslist, len(pa))
+					plb := make(partitionslist, len(pb))
+					copy(pla, pa)
+					copy(plb, pb)
+					sort.Sort(pla)
+					sort.Sort(plb)
+					if !pla.Equal(plb) {
+						return false, fmt.Sprintf("member %q, topic %q mismatch", member, t)
+					}
+				} else {
+					return false, fmt.Sprintf("member %q, topic %q missing", member, t)
+				}
+			}
+
+		} else {
+			return false, fmt.Sprintf("member %q is missing", member)
+		}
+
+	}
+	if len(a) != len(b) {
+		return false, fmt.Sprintf("unequal number of members")
+	}
+
+	return true, ""
+}
 
 // test behavior when clients have no preexisting state
 func TestGreenfield(t *testing.T) {
@@ -100,8 +157,69 @@ func TestStable(t *testing.T) {
 	t.Logf("preexisting = %v", pretty.Sprint(preexisting))
 	t.Logf("assignment = %v", pretty.Sprint(a))
 
-	if !reflect.DeepEqual(preexisting, a) {
-		t.Error("partitioning altered stable assignment")
+	if eq, why := preexisting.Equal(a); !eq {
+		t.Error("partitioning altered stable assignment:", why)
+	}
+}
+
+// test behavior when clients have a preexisting assignment but one client "restarts"
+func TestRestart(t *testing.T) {
+	var partitioner consumer.Partitioner = stable.New(false)
+
+	topics := []string{"topic1", "topic2", "topic3", "topic4"}
+
+	var mock_client = mockClient{
+		config: sarama.NewConfig(),
+		partitions: map[string][]int32{
+			"topic1": []int32{0, 1 /*,no 2*/, 3, 4, 5, 6, 7}, // note we pretend partition 2 is offline
+			"topic2": []int32{0, 1},
+			"topic3": []int32{0, 1, 2, 3, 4, 5}, // exactly 2 partitions per member
+			"topic4": []int32{0, 1, 2},          // exactly 1 partitions per member
+		},
+	}
+
+	// pretend to have 3 members, with some preexisting assignments, asking for all the topics
+	var preexisting = assignments{
+		"member0": map[string][]int32{
+			"topic1": []int32{0, 4},
+			"topic2": []int32{1},
+			"topic3": []int32{4, 5},
+			"topic4": []int32{1},
+		},
+		"member1": nil, // pretend member1 just restarted
+		"member2": map[string][]int32{
+			"topic1": []int32{3, 5, 6},
+			"topic2": []int32{0},
+			"topic3": []int32{1, 0},
+			"topic4": []int32{0},
+		},
+	}
+
+	var jreqs [3]sarama.JoinGroupRequest
+	for i := range jreqs {
+		jreqs[i].GroupId = "group"
+		id := fmt.Sprintf("member%d", i)
+		jreqs[i].MemberId = id
+		jreqs[i].ProtocolType = "consumer"
+		partitioner.PrepareJoin(&jreqs[i], topics, preexisting[id])
+	}
+
+	a := join_and_sync(jreqs[:], partitioner, &mock_client, t)
+	t.Logf("preexisting = %v", pretty.Sprint(preexisting))
+	t.Logf("assignment = %v", pretty.Sprint(a))
+
+	// insert the correct answer for member1
+	preexisting["member1"] = map[string][]int32{
+		"topic1": []int32{1, 7},
+		"topic2": nil,
+		"topic3": []int32{3, 2},
+		"topic4": []int32{2},
+	}
+	t.Logf("expected = %v", pretty.Sprint(preexisting))
+
+	// and compare
+	if eq, why := preexisting.Equal(a); !eq {
+		t.Error("partitioning altered stable assignment after a restart:", why)
 	}
 }
 
