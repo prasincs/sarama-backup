@@ -17,6 +17,10 @@ func TestDataMarshal(t *testing.T) {
 
 	b := d.marshal()
 	t.Logf("% x", b)
+
+	// append some extra garbage, representing future, backwards-compabitble-by-ignoring data
+	b = append(b, "garbage from the future"...)
+
 	var d2 data
 	err := d2.unmarshal(b)
 	if err != nil {
