@@ -75,8 +75,8 @@ func (err *Error) Error() string {
 // Config must not be modified. (doing so leads to data races, and may caused bugs as well).
 //
 // In addition to this config, consumer's code also looks at the sarama.Config of the sarama.Client
-// supplied to NewClient, especially at the Consumer.Offsets settings, Version, Metadata.Retry.Backoff
-// and ChannelBufferSize.
+// supplied to NewClient, especially at the Consumer.Offsets settings, Version, Metadata.Retry.Backoff,
+// Metadata.RefreshFrequency and ChannelBufferSize.
 type Config struct {
 	Session struct {
 		// The allowed session timeout for registered consumers (defaults to 30s).
@@ -153,6 +153,7 @@ func NewConfig() *Config {
   ErrOffsetOutOfRange is desired, sarama.Config.Consumer.Return.Errors = true.
 
   In addition, this package uses the settings in sarama.Config.Consumer.Offsets
+  and sarama.Config.Metadata.RefreshFrequency
 */
 func NewClient(group_name string, config *Config, sarama_client sarama.Client) (Client, error) {
 
@@ -483,6 +484,7 @@ join_loop:
 			ProtocolType:   "consumer", // we implement the standard kafka 0.9 consumer protocol metadata
 		}
 
+		num_partitions := make(map[string]int, len(consumers))
 		{ // prepare the join request
 			var topics = make([]string, 0, len(consumers))
 			var current_assignments = make(map[string][]int32, len(consumers))
@@ -490,6 +492,14 @@ join_loop:
 				topics = append(topics, topic)
 				if a := assignments[topic]; a != nil && len(a) != 0 { // omit any topics for which we are not assigned a partition
 					current_assignments[topic] = a
+				}
+
+				// and keep track of the # of partitions we saw before we joined
+				partitions, err := cl.client.Partitions(topic)
+				if err != nil {
+					cl.deliverError(fmt.Sprintf("looking up partitions of topic %q", topic), err)
+				} else {
+					num_partitions[topic] = len(partitions)
 				}
 			}
 			cl.config.Partitioner.PrepareJoin(jreq, topics, current_assignments)
@@ -621,6 +631,11 @@ join_loop:
 		if clconfig.Consumer.Offsets.CommitInterval > 0 {
 			commit_timer = time.After(clconfig.Consumer.Offsets.CommitInterval)
 		} // else don't commit periodically (we still commit when closing down)
+		// and the metadata check timer
+		var metadata_timer <-chan time.Time
+		if clconfig.Metadata.RefreshFrequency > 0 {
+			metadata_timer = time.After(clconfig.Metadata.RefreshFrequency)
+		}
 
 		// and loop, sending heartbeats until something happens and we need to rejoin (or exit)
 		for {
@@ -734,6 +749,29 @@ join_loop:
 				}
 
 				commit_timer = time.After(clconfig.Consumer.Offsets.CommitInterval)
+
+			case <-metadata_timer:
+				dbgf("metadata timer")
+				// the sarama.Client has refreshed its metadata within the interval
+				// all we do is verify the number of partitions hasn't changed since we joined a topic
+				// this is a local calculation, so no need for any fancy concurrency
+				for topic := range consumers {
+					partitions, err := cl.client.Partitions(topic)
+					if err != nil {
+						cl.deliverError(fmt.Sprintf("looking up the partitions of topic %q", topic), err)
+						// and rejoin the groups
+						continue join_loop
+					}
+					if len(partitions) != num_partitions[topic] {
+						dbgf("num_partitions of topic %q changed from %d to %d; rejoining", topic, num_partitions[topic], len(partitions))
+						// rejoin the new partition count (presumably some new partitions have been added, since you can't remove partitions from a running kafka broker)
+						continue join_loop
+					}
+				}
+
+				// this drifts slightly. is that good enough for this use case or must I use a time.Ticker? the worst that happens is an interval is skipped. That is ok, we'll
+				// pick up the change in the next interval.
+				metadata_timer = time.After(clconfig.Metadata.RefreshFrequency)
 
 			case a := <-cl.add_consumer:
 				add(a)
