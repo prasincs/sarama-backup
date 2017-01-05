@@ -122,6 +122,18 @@ func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 	}
 	dbgf("by_topic = %v", by_topic)
 
+	// make sure we have fresh metadata for all these topics
+	if len(by_topic) != 0 {
+		topics := make([]string, 0, len(by_topic))
+		for t := range by_topic {
+			topics = append(topics, t)
+		}
+		err = client.RefreshMetadata(topics...)
+		if err != nil {
+			return err
+		}
+	} // else asking for RefreshMetadata() would refresh all known topics, which is expensive and unnecessary
+
 	// lookup the partitions in each topic. since we are asking for all partitions, not just the online ones, the numbering
 	// appears to always be 0...N-1. But in case I don't understand kafka and there is some corner case where the numbering
 	// of partitions is different I keep careful track of the exact numbers I've received.
