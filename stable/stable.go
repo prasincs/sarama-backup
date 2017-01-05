@@ -114,7 +114,7 @@ func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 		for _, topic := range request.Topics {
 			members, ok := by_topic[topic]
 			if !ok {
-				members = make(map[string][]int32)
+				members = make(map[string][]int32, len(by_member)) // capacity is a guess bases on the observation that members typically consume all topics
 				by_topic[topic] = members
 			}
 			members[member] = data.assignments[topic] // NOTE: might be nil, which is OK. It just means the member wants to consume the partition but isn't doing so currently
@@ -125,7 +125,7 @@ func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 	// lookup the partitions in each topic. since we are asking for all partitions, not just the online ones, the numbering
 	// appears to always be 0...N-1. But in case I don't understand kafka and there is some corner case where the numbering
 	// of partitions is different I keep careful track of the exact numbers I've received.
-	var partitions_by_topic = make(map[string]partitionslist)
+	var partitions_by_topic = make(map[string]partitionslist, len(by_topic))
 	for topic := range by_topic {
 		// note: calls to client.Partitions() hit the metadata cache in the sarama client, so we don't gain much by asking concurrently
 		partitions, err := client.Partitions(topic)
@@ -144,7 +144,7 @@ func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 	dbgf("partitions_by_topic = %v", partitions_by_topic)
 
 	// and compute the sorted set of members of each topic
-	var members_by_topic = make(map[string]memberslist)
+	var members_by_topic = make(map[string]memberslist, len(by_topic))
 	for topic, members := range by_topic {
 		ml := make(memberslist, 0, len(members))
 		for m := range members {
@@ -159,7 +159,7 @@ func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 		// I want topics with the same # of partitions and the same consumer group membership to result in the same partition assignments.
 		// That way messages published under identical partition keys in those topics will all end up consumed by the same member.
 		// So organize topics into groups which will be partitioned identically
-		var matched_topics = make(map[string]string) // map from each topic to the 'master' topic with the same # of partitions and group membership. Topics which are unique are their own master
+		var matched_topics = make(map[string]string, len(by_topic)) // map from each topic to the 'master' topic with the same # of partitions and group membership. Topics which are unique are their own master
 	topic_match_loop:
 		for topic, members := range members_by_topic {
 			// see if a match exists
@@ -197,12 +197,12 @@ func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 	}
 
 	// invert by_topic into the equivalent organized by member, and then by topic
-	assignments := make(map[string]map[string][]int32) // map of member to topics, and topic to partitions
+	assignments := make(map[string]map[string][]int32, len(by_member)) // map of member to topics, and topic to partitions
 	for topic, members := range by_topic {
 		for member, partitions := range members {
 			topics, ok := assignments[member]
 			if !ok {
-				topics = make(map[string][]int32)
+				topics = make(map[string][]int32, len(by_topic))
 				assignments[member] = topics
 			}
 			topics[topic] = partitions

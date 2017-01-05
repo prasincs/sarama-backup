@@ -32,7 +32,7 @@ func (rr roundRobinPartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topic
 
 // for each topic in jresp, assign the topic's partitions round-robin across the members requesting each topic
 func (roundRobinPartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
-	by_member, err := jresp.GetMembers()
+	by_member, err := jresp.GetMembers() // map of member to metadata
 	//dbgf("by_member %v", by_member)
 	if err != nil {
 		return err
@@ -53,7 +53,7 @@ func (roundRobinPartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 	//dbgf("by_topic %v", by_topic)
 
 	// finally, build our assignments of partitions to members
-	assignments := make(map[string]map[string][]int32) // map of member to topics, and topic to partitions
+	assignments := make(map[string]map[string][]int32, len(by_member)) // map of member to topics, and topic to partitions
 	for topic, members := range by_topic {
 		partitions, err := client.Partitions(topic)
 		//dbgf("Partitions(%q) = %v", topic, partitions)
@@ -72,7 +72,7 @@ func (roundRobinPartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 			for _, member_id := range members {
 				topics, ok := assignments[member_id]
 				if !ok {
-					topics = make(map[string][]int32)
+					topics = make(map[string][]int32, len(by_topic)) // capacity is a guess (and an upper bound)
 					assignments[member_id] = topics
 				}
 				topics[topic] = append(topics[topic], partitions[i])
