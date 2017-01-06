@@ -63,7 +63,7 @@ type Error struct {
 func (err *Error) Error() string {
 	if err.Topic != "" {
 		if err.Partition != -1 {
-			return fmt.Sprintf("consumer-group %q: Error %s, topic %q partition %d: %s", err.cl.group_name, err.Context, err.Topic, err.Partition, err.Err)
+			return fmt.Sprintf("consumer-group %q: Error %s, topic %q, partition %d: %s", err.cl.group_name, err.Context, err.Topic, err.Partition, err.Err)
 		}
 		return fmt.Sprintf("consumer-group %q: Error %s, topic %q: %s", err.cl.group_name, err.Context, err.Topic, err.Err)
 	}
