@@ -1127,6 +1127,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 						return
 					}
 
+					logf("consumer %q skipping to offset %d or partition %d", con.topic, offset, p)
 					consumer, err = con.consumer.ConsumePartition(con.topic, p, offset)
 					if err != nil {
 						con.deliverError(fmt.Sprintf("sarama.ConsumePartition at offset %d", offset), p, err)
@@ -1327,7 +1328,7 @@ func (part *partition) run() {
 				// This error cannot be fixed without seeking to a valid offset. However we can't assume that OffsetNewest is the right
 				// choice, nor OffsetOldest, nor "5 minutes ago" or anything else. It's up to the user to decide.
 				if sarama_err.Err == sarama.ErrOffsetOutOfRange {
-					dbgf("ErrOffsetOutOfRange topic %q partition %d", con.topic, part.partition)
+					logf("consumer %q partition %d received ErrOffsetOutOfRange and will be restarted", con.topic, part.partition)
 					select {
 					case con.restart_partitions <- part:
 					case <-con.closed:
