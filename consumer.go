@@ -101,15 +101,19 @@ type Config struct {
 	// OffsetOutOfRange is the handler for sarama.ErrOffsetOutOfRange errors (defaults to sarama.OffsetNewest,nil).
 	// Implementations must return the new starting offset in the partition, or an error. The sarama.Client is included
 	// for convenience, since handling this might involve querying the partition's current offsets.
-	OffsetOutOfRange func(topic string, partition int32, client sarama.Client) (offset int64, err error)
+	OffsetOutOfRange OffsetOutOfRange
 
 	// StartingOffset is a hook to allow modifying the starting offset when a Consumer begins to consume
 	// a partition. (defaults to returning the last committed offset). Some consumers might want to jump
 	// ahead to fresh messages. The sarama.Client is included for convenience, since handling this might involve
 	// looking up a partition's offset by time. When no committed offset could be found -1 (sarama.OffsetNewest)
 	// is passed in. An implementation might want to return client.Config().Consumer.Offsets.Initial in that case.
-	StartingOffset func(topic string, partition int32, committed_offset int64, client sarama.Client) (offset int64, err error)
+	StartingOffset StartingOffset
 }
+
+// types of the functions in the Config
+type StartingOffset func(topic string, partition int32, committed_offset int64, client sarama.Client) (offset int64, err error)
+type OffsetOutOfRange func(topic string, partition int32, client sarama.Client) (offset int64, err error)
 
 // default implementation of Config.OffsetOutOfRange jumps to the current head of the partition.
 func DefaultOffsetOutOfRange(topic string, partition int32, client sarama.Client) (int64, error) {
