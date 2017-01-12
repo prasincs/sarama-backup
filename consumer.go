@@ -388,6 +388,7 @@ func (cl *client) run(early_rc chan<- error) {
 		for con := range cl.rem_consumer {
 			rem(con)
 		}
+		wg.Wait()
 		// and shutdown the errors channel
 		close(cl.errors)
 	}
