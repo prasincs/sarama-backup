@@ -1,5 +1,5 @@
 /*
-  Utility functions for controlling starting and out-of-range offsets
+  Utility functions for managing starting and out-of-range offsets.
 
   These are useful in conjunction with the sarama-consumer.Config.StartingOffset
   and .OffsetOutOfRange configuration options.
@@ -7,7 +7,7 @@
   Copyright 2017 MistSys
 */
 
-package offset
+package offsets
 
 import (
 	"time"
