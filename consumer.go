@@ -247,6 +247,9 @@ type Consumer interface {
   Config.Partitioner to their implementation of Partitioner.
 */
 type Partitioner interface {
+	// name this partitioner (used for log messages)
+	Name() string
+
 	// PrepareJoin prepares a JoinGroupRequest given the topics supplied.
 	// The simplest implementation would be something like
 	//   join_req.AddGroupProtocolMetadata("<partitioner name>", &sarama.ConsumerGroupMemberMetadata{ Version: 1, Topics:  topics, })
@@ -527,6 +530,7 @@ join_loop:
 					num_partitions[topic] = len(partitions)
 				}
 			}
+			logf("consumer %q proposing partitioner %q", cl.group_name, cl.config.Partitioner.Name())
 			cl.config.Partitioner.PrepareJoin(jreq, topics, current_assignments)
 		}
 
@@ -579,7 +583,7 @@ join_loop:
 
 		// we have been chosen as the leader then we have to map the partitions
 		if jresp.LeaderId == member_id {
-			dbgf("leader is we")
+			dbgf("leader is we; partitioning using partitioner %s", cl.config.Partitioner.Name())
 			err := cl.config.Partitioner.Partition(sreq, jresp, cl.client)
 			if err != nil {
 				cl.deliverError("partitioning", err)

@@ -51,33 +51,40 @@ import (
 // a partitioner that assigns partitions to consumers such that as consumers come and go the least number of partitions are reassigned
 type stablePartitioner struct {
 	consistent bool
+	name       string
 }
 
 // New constructs a new stable partitioner.
 // If consistent is true then the partitioning is consistent for all topics which have the same consumers and the same # of partitions.
 // Otherwise each topic is partitioned independantly.
 func New(consistent bool) *stablePartitioner {
+	name := "stable"
+	if consistent {
+		name = "stable&consistent"
+	}
+
 	return &stablePartitioner{
 		consistent: consistent,
+		name:       name,
 	}
 }
-
-// the name of this partitioner's group protocol (all consumers in the group must agree on this, and it must not collide with other names)
-const Name = "stable&consistent"
 
 // print a debug message
 func dbgf(format string, args ...interface{}) {
 	//log.Printf(format, args...)
 }
 
-func (*stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string, current_assignments map[string][]int32) {
+func (sp *stablePartitioner) Name() string { return sp.name }
+
+func (sp *stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []string, current_assignments map[string][]int32) {
+	//fmt.Printf("stable.PrepareJoin(%q)\n", topics)
 	// encode the current assignments in a manner proprietary to this partitioner
 	var data = data{
 		version:     1,
 		assignments: current_assignments,
 	}
 
-	jreq.AddGroupProtocolMetadata(Name,
+	jreq.AddGroupProtocolMetadata(sp.name,
 		&sarama.ConsumerGroupMemberMetadata{
 			Version:  1,
 			Topics:   topics,
@@ -87,8 +94,8 @@ func (*stablePartitioner) PrepareJoin(jreq *sarama.JoinGroupRequest, topics []st
 
 // for each topic in jresp, assign the topic's partitions to the members requesting the topic
 func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sarama.JoinGroupResponse, client sarama.Client) error {
-	if jresp.GroupProtocol != Name {
-		return fmt.Errorf("sarama.JoinGroupResponse.GroupProtocol %q unexpected; expected %q", jresp.GroupProtocol, Name)
+	if jresp.GroupProtocol != sp.name {
+		return fmt.Errorf("sarama.JoinGroupResponse.GroupProtocol %q unexpected; expected %q", jresp.GroupProtocol, sp.name)
 	}
 	by_member, err := jresp.GetMembers() //  map of member to ConsumerGroupMemberMetadata
 	dbgf("by_member = %v", by_member)
