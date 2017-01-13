@@ -432,11 +432,17 @@ join_loop:
 					if err != nil {
 						cl.deliverError(fmt.Sprintf("Close()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
 					}
+				} else if err != nil {
+					// remote the earlier error
+					cl.deliverError(fmt.Sprintf("past Open() of coordinating broker %d %s", coor.ID(), coor.Addr()), err)
 				}
+
 				err := coor.Open(cl.client.Config())
 				if err != nil {
-					cl.deliverError(fmt.Sprintf("re Open()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
+					cl.deliverError(fmt.Sprintf("re-Open()ing coordinating broker %d %s", coor.ID(), coor.Addr()), err)
 				}
+				// coor.Open() is asynchronous. We'll continue without waiting (without doing an coor.Connected() call)
+				// because coor might not even be our coordinator anymore (and might not exist)
 			}
 			reopen = false
 
@@ -447,7 +453,7 @@ join_loop:
 		if refresh {
 			dbgf("refreshing coordinating broker")
 
-			// refresh the group coordinator (because sarama caches the result, and the cache must be manually invalidated by us when we decide it might be needed)
+			// refresh the group coordinator (because sarama caches the result, and the cache must be manually refreshed by us when we decide an invalidate might be needed)
 			err := cl.client.RefreshCoordinator(cl.group_name)
 			if err != nil {
 				err = cl.makeError("refreshing coordinating broker", err)
@@ -468,7 +474,7 @@ join_loop:
 		var err error
 		coor, err = cl.client.Coordinator(cl.group_name)
 		if err != nil {
-			err = cl.makeError("contacting coordinating broker", err)
+			err = cl.makeError("contacting coordinating broker "+coor.Addr(), err)
 			if early_rc != nil {
 				early_rc <- err
 				return
@@ -480,6 +486,20 @@ join_loop:
 			continue join_loop
 		}
 		dbgf("Coordinator %v %v", coor.ID(), coor.Addr())
+
+		// make sure we are connected to the broker
+		if ok, err := coor.Connected(); !ok {
+			err = cl.makeError("connecting coordinating broker "+coor.Addr(), err)
+			if early_rc != nil {
+				early_rc <- err
+				return
+			}
+			cl.deliverError("", err)
+
+			pause = true
+			reopen = true
+			continue join_loop
+		}
 
 		// join the group
 		jreq := &sarama.JoinGroupRequest{
@@ -692,7 +712,7 @@ join_loop:
 					err = resp.Err
 				}
 				if err != nil {
-					cl.deliverError("heartbeating", err)
+					cl.deliverError("heartbeating with "+coor.Addr(), err)
 					// we've got heartbeat troubles of one kind or another; disconnect and reconnect
 					continue join_loop
 				}
@@ -731,7 +751,7 @@ join_loop:
 				dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
 				// log any errors we got. there isn't much we can do about them
 				if err != nil {
-					cl.deliverError("committing offsets", err)
+					cl.deliverError("committing offsets to "+coor.Addr(), err)
 					reopen = true
 				} else {
 					for topic, partitions := range ocresp.Errors {
