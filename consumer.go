@@ -940,7 +940,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 				delete(partitions, p)
 				part.consumer.Close()
 				offset := part.oldest
-				if offset == samra.OffsetNewest || offset == sarama.OffsetOldest {
+				if offset == sarama.OffsetNewest || offset == sarama.OffsetOldest {
 					continue // omit this partition, there is no yet offset we can commit
 				}
 				if len(part.buckets) != 0 {
@@ -976,7 +976,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		dbgf("consumer %q commit_req(%v)", con.topic, c)
 		for p, partition := range partitions {
 			offset := partition.oldest
-			if offset == samra.OffsetNewest || offset == sarama.OffsetOldest {
+			if offset == sarama.OffsetNewest || offset == sarama.OffsetOldest {
 				continue // omit this partition, there is no yet offset we can commit
 			}
 			if len(partition.buckets) != 0 {
