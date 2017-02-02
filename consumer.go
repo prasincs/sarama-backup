@@ -940,6 +940,9 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 				delete(partitions, p)
 				part.consumer.Close()
 				offset := part.oldest
+				if offset == samra.OffsetNewest || offset == sarama.OffsetOldest {
+					continue // omit this partition, there is no yet offset we can commit
+				}
 				if len(part.buckets) != 0 {
 					if part.buckets[0][0] == part.buckets[0][1] {
 						// add to that the portion of the last block we know been completed (this is often useful when the traffic rate is low or a client shuts down cleanly, since it has probably cleanly returned all offsets we've delivered)
@@ -973,6 +976,9 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		dbgf("consumer %q commit_req(%v)", con.topic, c)
 		for p, partition := range partitions {
 			offset := partition.oldest
+			if offset == samra.OffsetNewest || offset == sarama.OffsetOldest {
+				continue // omit this partition, there is no yet offset we can commit
+			}
 			if len(partition.buckets) != 0 {
 				if partition.buckets[0][0] == partition.buckets[0][1] {
 					// add to that the portion of the last block we know been completed (this is useful when the message rate is slow)
@@ -1315,7 +1321,7 @@ type partition struct {
 	// we group offsets in groups of 64 and simply keep a count of how many are outstanding
 	// any time the two counts are equal then the offsets are committable. Otherwise we can't tell which is the not yet Done() offset and so we don't know
 	buckets [][2]uint8
-	oldest  int64 // 1st offset in bucket[0]
+	oldest  int64 // 1st offset in bucket[0], or OffsetNewest or OffsetOldest if we haven't received any msgs and started at one of those offsets
 }
 
 // wrap a sarama.ConsumerError into an *Error
