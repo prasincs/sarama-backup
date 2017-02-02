@@ -1022,7 +1022,7 @@ func (cl *client) consumeSidechannel(topic string, queries <-chan sidechannel_qu
 			}
 			partition = parts[p1]
 		}
-		dbgf("consuming %q partition %d", topic, partition)
+		dbgf("consumeSidechannel consuming %q partition %d", topic, partition)
 
 		pconsumer, err := sconsumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
 		if err != nil {
@@ -1065,7 +1065,7 @@ loop:
 			// TODO close and reconnect? Keep going?
 
 		case kmsg, ok := <-msgs:
-			dbgf("consumeSidechannel msg %v, %v", kmsg, ok)
+			dbgf("consumeSidechannel msg %s, %v", kmsg, ok)
 			if !ok {
 				break loop
 			}
