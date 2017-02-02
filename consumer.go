@@ -418,20 +418,23 @@ func (cl *client) run(early_rc chan<- error) {
 
 		// gather up the offsets to commit
 		var wg sync.WaitGroup
-		resp := make(chan SidechannelOffset)
+		resp := make(chan commit_resp)
 		for _, con := range consumers {
 			wg.Add(1)
 			con.commit_reqs <- commit_req{resp, &wg}
 		}
-		go func(resp chan SidechannelOffset, wg *sync.WaitGroup) {
+		go func(resp chan commit_resp, wg *sync.WaitGroup) {
 			wg.Wait()
 			close(resp)
 		}(resp, &wg)
 
-		var offsets []SidechannelOffset
+		var offsets = make(map[string][]SidechannelOffset)
 		for r := range resp {
-			dbgf("commit (%q, %d, %d)", r.Topic, r.Partition, r.Offset)
-			offsets = append(offsets, r)
+			dbgf("commit (%q, %d, %d)", r.topic, r.partition, r.offset)
+			offsets[r.topic] = append(offsets[r.topic], SidechannelOffset{
+				Partition: r.partition,
+				Offset:    r.offset,
+			})
 		}
 		if len(offsets) == 0 {
 			// no offsets to commit
@@ -862,19 +865,19 @@ join_loop:
 					ocreq.RetentionTime = -1 // use broker's value
 				}
 				var wg sync.WaitGroup
-				resp := make(chan SidechannelOffset, num_assigned_partitions) // allocating room for the responses helps the code run smoothly
+				resp := make(chan commit_resp, num_assigned_partitions) // allocating room for the responses helps the code run smoothly
 				for _, con := range consumers {
 					wg.Add(1)
 					con.commit_reqs <- commit_req{resp, &wg}
 				}
-				go func(resp chan SidechannelOffset, wg *sync.WaitGroup) {
+				go func(resp chan commit_resp, wg *sync.WaitGroup) {
 					wg.Wait()
 					close(resp)
 				}(resp, &wg)
 				empty := true
 				for r := range resp {
-					dbgf("ocreq.AddBlock(%q, %d, %d)", r.Topic, r.Partition, r.Offset)
-					ocreq.AddBlock(r.Topic, r.Partition, r.Offset, 0, "")
+					dbgf("ocreq.AddBlock(%q, %d, %d)", r.topic, r.partition, r.offset)
+					ocreq.AddBlock(r.topic, r.partition, r.offset, 0, "")
 					empty = false
 				}
 				if empty {
@@ -1088,11 +1091,13 @@ loop:
 			}
 
 			// save/update the offsets in our local table
-			for i := range msg.Offsets {
-				o := &msg.Offsets[i]
-				// THINK: should I allow a new offset that is < the last known offset? It is useful to allow it in order to permit manually rewinding clients, so I'll allow it for now
-				dbgf("consumeSidechannel noting %+v", o)
-				offsets[sidechannel_key{o.Topic, o.Partition}] = o.Offset
+			for topic, topic_offsets := range msg.Offsets {
+				for i := range topic_offsets {
+					o := &topic_offsets[i]
+					// THINK: should I allow a new offset that is < the last known offset? It is useful to allow it in order to permit manually rewinding clients, so I'll allow it for now
+					dbgf("consumeSidechannel noting %+v", o)
+					offsets[sidechannel_key{topic, o.Partition}] = o.Offset
+				}
 			}
 
 		case q := <-queries:
@@ -1153,20 +1158,25 @@ type consumer struct {
 
 // commit_req is a request for a consumer to send back the client its part into a OffsetCommitRequest
 type commit_req struct {
-	resp chan<- SidechannelOffset
+	resp chan<- commit_resp
 	wg   *sync.WaitGroup
+}
+
+type commit_resp struct {
+	topic     string
+	partition int32
+	offset    int64
 }
 
 // SidechannelMsg is what is published to and read from the Config.SidechannelTopic
 type SidechannelMsg struct {
-	Ver           int    // should be 1
-	ConsumerGroup string // name of the consumer group sending the offsets (also used as the kafka message key)
-	Offsets       []SidechannelOffset
+	Ver           int                            // should be 1
+	ConsumerGroup string                         // name of the consumer group sending the offsets (also used as the kafka message key)
+	Offsets       map[string][]SidechannelOffset // map from topic to list of <partition,offset> pairs
 }
 
 // SidechannelOffset contains the offset a single partition
 type SidechannelOffset struct {
-	Topic     string
 	Partition int32
 	Offset    int64
 	// if someday we make use of the timestamp and metadata fields we'd add them here
@@ -1290,7 +1300,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 					offset += int64(partition.buckets[0][1])
 				} // else we don't know enough to commit any further
 			}
-			c.resp <- SidechannelOffset{Topic: con.topic, Partition: p, Offset: offset}
+			c.resp <- commit_resp{topic: con.topic, partition: p, offset: offset}
 		}
 		c.wg.Done()
 	}
