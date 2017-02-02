@@ -1177,8 +1177,8 @@ type SidechannelMsg struct {
 
 // SidechannelOffset contains the offset a single partition
 type SidechannelOffset struct {
-	Partition int32
-	Offset    int64
+	Partition int32 `json:"p"` // use short field names in JSON to keep the size of the messages low
+	Offset    int64 `json:"o"` // since there can be a lot of SidechannelOffsets in a SidechannelMsg
 	// if someday we make use of the timestamp and metadata fields we'd add them here
 }
 
