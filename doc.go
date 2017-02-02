@@ -45,9 +45,10 @@ to implement.
 
 PHILOSOPHY
 
-The consumer API has three rules: messages must be passed to Consumer.Done() once each message does
-not need to be replayed, Client.Errors() must be consumed, and Client.Close() or Consumer.AsyncClose() must
-be called to clean up resources if your code wishes to stop consuming messages.
+The consumer API has three rules the calling code must abide: messages must be passed to Consumer.Done()
+once each message does not need to be replayed, Client.Errors() must be consumed, and Client.Close()
+or Consumer.AsyncClose() must be called to clean up resources if your code wishes to stop consuming
+messages.
 
 Kafka's rule that [if consumers keep up] all messages will be seen at least once, and possibly
 many times always applies.
