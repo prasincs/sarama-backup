@@ -711,9 +711,10 @@ join_loop:
 
 		// send SyncGroup
 		var sresp *sarama.SyncGroupResponse
+		done = make(chan struct{})
 		go func(sreq *sarama.SyncGroupRequest) {
 			dbgf("sending SyncGroupRequest %v", sreq)
-			sresp, err := coor.SyncGroup(sreq)
+			sresp, err = coor.SyncGroup(sreq)
 			dbgf("received SyncGroupResponse %v, %v", sresp, err)
 			close(done)
 		}(sreq)
