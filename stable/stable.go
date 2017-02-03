@@ -97,7 +97,7 @@ func (sp *stablePartitioner) Partition(sreq *sarama.SyncGroupRequest, jresp *sar
 	if jresp.GroupProtocol != sp.name {
 		return fmt.Errorf("sarama.JoinGroupResponse.GroupProtocol %q unexpected; expected %q", jresp.GroupProtocol, sp.name)
 	}
-	by_member, err := jresp.GetMembers() //  map of member to ConsumerGroupMemberMetadata
+	by_member, err := jresp.GetMembers() // map of member to ConsumerGroupMemberMetadata
 	dbgf("by_member = %v", by_member)
 	if err != nil {
 		return err

@@ -951,7 +951,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 				}
 				dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
 				ocreq.AddBlock(con.topic, p, offset, 0, "")
-				logf("consumer %q stopped consuming partition %d at offset %d", con.topic, p, offset)
+				logf("consumer %q stopped consuming %q partition %d at offset %d", con.cl.group_name, con.topic, p, offset)
 			}
 		}
 		dbgf("sending OffsetCommitRequest %v", ocreq)
@@ -1107,9 +1107,9 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			oreq.AddPartition(con.topic, p)
 		}
 
-		dbgf("consumer %q sending OffsetFetchRequest %v", con.topic, oreq)
+		dbgf("consumer %q of %q sending OffsetFetchRequest %v", con.cl.group_name, con.topic, oreq)
 		oresp, err := a.coordinator.FetchOffset(oreq)
-		dbgf("consumer %q received OffsetFetchResponse %v, %v", con.topic, oresp, err)
+		dbgf("consumer %q of %q received OffsetFetchResponse %v, %v", con.cl.group_name, con.topic, oresp, err)
 		if err != nil {
 			con.deliverError("fetching offsets", -1, err)
 			// and we can't consume any of the new partitions without the offsets
@@ -1143,7 +1143,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 					return
 				}
 
-				logf("consumer %q consuming partition %d at offset %d", con.topic, p, offset)
+				logf("consumer %q consuming %q partition %d at offset %d", con.cl.group_name, con.topic, p, offset)
 
 				consumer, err := con.consumer.ConsumePartition(con.topic, p, offset)
 				if err != nil {
@@ -1162,7 +1162,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 						return
 					}
 
-					logf("consumer %q skipping to offset %d of partition %d", con.topic, offset, p)
+					logf("consumer %q skipping to %q partition %d offset %d", con.cl.group_name, con.topic, p, offset)
 					consumer, err = con.consumer.ConsumePartition(con.topic, p, offset)
 					if err != nil {
 						con.deliverError(fmt.Sprintf("sarama.ConsumePartition at offset %d", offset), p, err)
@@ -1223,7 +1223,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			return
 		}
 
-		logf("consumer %q restarting consuming partition %d at offset %d", con.topic, p, offset)
+		logf("consumer %q restarting consuming %q partition %d at offset %d", con.cl.group_name, con.topic, p, offset)
 
 		part = &partition{
 			con:       con,
@@ -1363,7 +1363,7 @@ func (part *partition) run() {
 				// This error cannot be fixed without seeking to a valid offset. However we can't assume that OffsetNewest is the right
 				// choice, nor OffsetOldest, nor "5 minutes ago" or anything else. It's up to the user to decide.
 				if sarama_err.Err == sarama.ErrOffsetOutOfRange {
-					logf("consumer %q partition %d received ErrOffsetOutOfRange and will be restarted", con.topic, part.partition)
+					logf("consumer %q of %q partition %d received ErrOffsetOutOfRange and will be restarted", con.cl.group_name, con.topic, part.partition)
 					select {
 					case con.restart_partitions <- part:
 					case <-con.closed:
