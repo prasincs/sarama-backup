@@ -1162,7 +1162,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 						return
 					}
 
-					logf("consumer %q skipping to offset %d or partition %d", con.topic, offset, p)
+					logf("consumer %q skipping to offset %d of partition %d", con.topic, offset, p)
 					consumer, err = con.consumer.ConsumePartition(con.topic, p, offset)
 					if err != nil {
 						con.deliverError(fmt.Sprintf("sarama.ConsumePartition at offset %d", offset), p, err)
