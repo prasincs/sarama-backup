@@ -895,16 +895,24 @@ join_loop:
 					cl.deliverError("committing offsets to "+coor.Addr(), err)
 					reopen = true
 				} else {
+					var prev_kerr sarama.KError // don't print the same error over and over. usually the same error will happen to all partitions
 					for topic, partitions := range ocresp.Errors {
 						for p, kerr := range partitions {
 							if kerr != 0 {
-								cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), kerr)
+								if kerr != prev_kerr {
+									cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), kerr)
+									prev_kerr = kerr
+								} else {
+									dbgf("same error committing offset of topic %q partition %d", topic, p, kerr)
+								}
 								switch kerr {
 								case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
 									refresh = true         // the broker is no longer the coordinator. we should refresh the current coordinator
 									try_sidechannel = true // and send the commits to the side-channel (if we have one) in the hope that that might work
 								case sarama.ErrUnknownMemberId:
 									member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
+								case sarama.ErrIllegalGeneration:
+									try_sidechannel = true // a new generation is forming; send our offsets to the sidechannel
 								}
 								err = kerr // any of the kerr's will do
 							}
@@ -912,7 +920,7 @@ join_loop:
 					}
 				}
 				if try_sidechannel {
-					// immediately send this commit to the side channel
+					// immediately send a commit to the side channel
 					commitToSidechannel()
 				}
 				if err != nil {
@@ -1289,10 +1297,16 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		if err != nil {
 			con.deliverError("committing offsets", -1, err)
 		} else {
+			var prev_kerr sarama.KError // don't print the same error over and over. usually the same error will happen to all partitions
 			for _, partitions := range ocresp.Errors {
-				for p, err := range partitions {
-					if err != 0 {
-						con.deliverError("committing offset", p, err)
+				for p, kerr := range partitions {
+					if kerr != 0 {
+						if kerr != prev_kerr {
+							con.deliverError("committing offset", p, kerr)
+							prev_kerr = kerr
+						} else {
+							dbgf("same error committing offset of topic %q partition %d", con.topic, p, kerr)
+						}
 					}
 				}
 			}
