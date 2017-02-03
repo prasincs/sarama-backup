@@ -474,7 +474,7 @@ func (cl *client) run(early_rc chan<- error) {
 			cl.deliverError("marshaling SidechannelMsg", err)
 			return
 		}
-		logf("sending offsets to side-channel topic %q", cl.config.SidechannelTopic)
+		dbgf("sending offsets to side-channel topic %q", cl.config.SidechannelTopic)
 		producer.Input() <- &sarama.ProducerMessage{
 			Topic: cl.config.SidechannelTopic,
 			Key:   sarama.StringEncoder(cl.group_name),
@@ -486,7 +486,9 @@ func (cl *client) run(early_rc chan<- error) {
 	var sidechannel_queries chan sidechannel_query
 	if topic := cl.config.SidechannelTopic; topic != "" {
 		sidechannel_queries = make(chan sidechannel_query)
-		go cl.consumeSidechannel(topic, sidechannel_queries)
+		ready := make(chan struct{})
+		go cl.sidechannel(topic, sidechannel_queries, ready)
+		<-ready // wait until sidechannel subscription is ready, since we want to capture the sidechannel msgs we will trigger by our join-group request
 	} // else leave sidechannel_queries nil
 
 	// start the commit timer
@@ -970,17 +972,17 @@ type sidechannel_offset struct {
 	offset int64
 }
 
-func (cl *client) consumeSidechannel(topic string, queries <-chan sidechannel_query) {
-	dbgf("consumeSidechannel(%q)", topic)
-	defer dbgf("consumeSidechannel(%q) exiting", topic)
+func (cl *client) sidechannel(topic string, queries <-chan sidechannel_query, ready chan<- struct{}) {
+	dbgf("sidechannel(%q)", topic)
+	defer dbgf("sidechannel(%q) exiting", topic)
 	// local table of {topic,partition} -> offset
 	offsets := make(map[sidechannel_key]int64)
 
 	// consume from the appropriate partition of our side channel
 	start := func() (sarama.Consumer, sarama.PartitionConsumer) { // func just to have a nice clean way to return out of error conditions
-		dbgf("consumeSidechannel start")
+		dbgf("sidechannel start")
 		if topic == "" {
-			dbgf("consumeSidechannel no topic (disabled)")
+			dbgf("sidechannel no topic (disabled)")
 			return nil, nil
 		}
 		sconsumer, err := sarama.NewConsumerFromClient(cl.client)
@@ -988,20 +990,20 @@ func (cl *client) consumeSidechannel(topic string, queries <-chan sidechannel_qu
 			cl.deliverError("creating sarama consumer", err)
 			return nil, nil
 		}
-		dbgf("consumeSidechannel got sconsumer")
+		dbgf("sidechannel got sconsumer")
 		parts, err := sconsumer.Partitions(topic)
 		if err != nil {
 			cl.deliverError("listing partitions of side-channel topic "+topic, err)
 			return sconsumer, nil
 		}
-		dbgf("consumeSidechannel got partitions %v", parts)
+		dbgf("sidechannel got partitions %v", parts)
 		var partition int32
-		if false && len(parts) == 1 {
+		if len(parts) == 1 {
 			partition = parts[0] // no choice
 		} else {
 			// what does the partitioner do with our consumer group name?
 			parter := cl.client.Config().Producer.Partitioner(topic)
-			dbgf("consumeSidechannel got partitioner %v", parter)
+			dbgf("sidechannel got partitioner %v", parter)
 			test_msg := &sarama.ProducerMessage{
 				Topic: topic,
 				Key:   sarama.StringEncoder(cl.group_name),
@@ -1018,21 +1020,21 @@ func (cl *client) consumeSidechannel(topic string, queries <-chan sidechannel_qu
 				cl.deliverError("can't pick a partition in side-channel topic "+topic, err)
 				return sconsumer, nil
 			}
-			dbgf("consumeSidechannel got partition responses %v, %v", p1, p2)
+			dbgf("sidechannel got partition responses %v, %v", p1, p2)
 			if p1 != p2 {
 				cl.deliverError("", fmt.Errorf("partitioning is inconsistent in side-channel topic %q", topic))
 				return sconsumer, nil
 			}
 			partition = parts[p1]
 		}
-		dbgf("consumeSidechannel consuming %q partition %d", topic, partition)
+		dbgf("sidechannel consuming %q partition %d", topic, partition)
 
 		pconsumer, err := sconsumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
 		if err != nil {
 			cl.deliverError(fmt.Sprintf("consuming side-channel partition %d of %s", partition, topic), err)
 			return sconsumer, nil
 		}
-		dbgf("consumeSidechannel got partition consumer %v", pconsumer)
+		dbgf("sidechannel got partition consumer %v", pconsumer)
 		return sconsumer, pconsumer
 	}
 
@@ -1048,19 +1050,24 @@ func (cl *client) consumeSidechannel(topic string, queries <-chan sidechannel_qu
 		errors = sidechannel_partition_consumer.Errors()
 	}
 
+	if ready != nil {
+		close(ready)
+		ready = nil
+	}
+
 	our_key := []byte(cl.group_name)
-	dbgf("consumeSidechannel msgs %v", msgs)
-	dbgf("consumeSidechannel errors %v", errors)
-	dbgf("consumeSidechannel our_key %q", our_key)
+	dbgf("sidechannel msgs %v", msgs)
+	dbgf("sidechannel errors %v", errors)
+	dbgf("sidechannel our_key %q", our_key)
 loop:
 	for {
 		select {
 		case <-cl.closed:
-			dbgf("consumeSidechannel client closed")
+			dbgf("sidechannel client closed")
 			// consumer is shutting down
 			return
 		case err, ok := <-errors:
-			dbgf("consumeSidechannel error %v, %v", err, ok)
+			dbgf("sidechannel error %v, %v", err, ok)
 			if !ok {
 				break loop
 			}
@@ -1068,13 +1075,13 @@ loop:
 			// TODO close and reconnect? Keep going?
 
 		case kmsg, ok := <-msgs:
-			dbgf("consumeSidechannel msg %s, %v", kmsg, ok)
+			dbgf("sidechannel msg %v, %v", kmsg, ok)
 			if !ok {
 				break loop
 			}
 			if !bytes.Equal(kmsg.Key, our_key) {
 				// ignore the msg; it belongs to a different consumer group
-				dbgf("consumeSidechannel ignore; key %q != %q", kmsg.Key, our_key)
+				dbgf("sidechannel ignore; key %q != %q", kmsg.Key, our_key)
 				continue
 			}
 			// decode the msg
@@ -1084,7 +1091,7 @@ loop:
 				cl.deliverError("error unmarshaling  side-channel msg", err)
 				continue
 			}
-			dbgf("consumeSidechannel msg %v", msg)
+			dbgf("sidechannel msg %v", msg)
 			if msg.Ver != 1 {
 				cl.deliverError("", fmt.Errorf("Unknown SidechannelMsg version %d", msg.Ver))
 				continue
@@ -1093,25 +1100,31 @@ loop:
 			// save/update the offsets in our local table
 			for topic, topic_offsets := range msg.Offsets {
 				for i := range topic_offsets {
-					o := &topic_offsets[i]
-					// THINK: should I allow a new offset that is < the last known offset? It is useful to allow it in order to permit manually rewinding clients, so I'll allow it for now
-					dbgf("consumeSidechannel noting %+v", o)
-					offsets[sidechannel_key{topic, o.Partition}] = o.Offset
+					to := &topic_offsets[i]
+					// record any new, gt offsets
+					key := sidechannel_key{topic, to.Partition}
+					o := offsets[key] // note zero-value works out fine
+					if to.Offset > o {
+						dbgf("sidechannel noting %+v > %d", to, o)
+						offsets[key] = to.Offset
+					} else {
+						dbgf("sidechannel ignoring %+v <= %d", to, o)
+					}
 				}
 			}
 
 		case q := <-queries:
-			dbgf("consumeSidechannel query %+v", q)
+			dbgf("sidechannel query %+v", q)
 			// look through the request and send back any we have, then close the reply channel to indicate we're done
 			for _, key := range q.queries {
 				o, ok := offsets[key]
 				if ok {
-					dbgf("consumeSidechannel replying %+v", sidechannel_offset{key, o})
+					dbgf("sidechannel replying %+v", sidechannel_offset{key, o})
 					q.reply <- sidechannel_offset{key, o}
 				}
 			}
 			close(q.reply)
-			dbgf("consumeSidechannel query answered")
+			dbgf("sidechannel query answered")
 		}
 	}
 }
@@ -1292,7 +1305,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		for p, partition := range partitions {
 			offset := partition.oldest
 			if offset == sarama.OffsetNewest || offset == sarama.OffsetOldest {
-				continue // omit this partition, there is no yet offset we can commit
+				continue // omit this partition, there is no offset yet that we can commit (we have not yet received any msgs on this partition)
 			}
 			if len(partition.buckets) != 0 {
 				if partition.buckets[0][0] == partition.buckets[0][1] {
