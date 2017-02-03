@@ -10,9 +10,10 @@ import (
 
 func TestNoOlderThanNow(t *testing.T) {
 	sa, ooor := NoOlderThan(0)
-	cl := &fakeClient{}
+	cl := &fakeClient{t}
 
 	o, err := sa("topic1", 0, 100, cl)
+	t.Logf("StartingOffset(100) -> %d", o)
 	if err != nil {
 		t.Error(err)
 	}
@@ -21,6 +22,7 @@ func TestNoOlderThanNow(t *testing.T) {
 	}
 
 	o, err = ooor("topic1", 0, cl)
+	t.Logf("OffsetOutOfRange() -> %d", o)
 	if err != nil {
 		t.Error(err)
 	}
@@ -32,10 +34,31 @@ func TestNoOlderThanNow(t *testing.T) {
 func TestNoOlderThan1Minute(t *testing.T) {
 	sa, ooor := NoOlderThan(time.Minute)
 
-	cl := &fakeClient{}
+	cl := &fakeClient{t}
 
 	approx := time.Now().Add(-time.Minute).UnixNano()
-	o, err := sa("topic1", 0, 100, cl)
+	o, err := sa("topic1", 0, -1, cl)
+	t.Logf("StartingOffset(-1) -> %d", o)
+	if err != nil {
+		t.Error(err)
+	}
+	if math.Abs(float64(o-approx)) > 1000000 {
+		t.Error("unexpected", o)
+	}
+
+	approx = time.Now().Add(-time.Minute).UnixNano()
+	o, err = sa("topic1", 0, 100, cl)
+	t.Logf("StartingOffset(100) -> %d", o)
+	if err != nil {
+		t.Error(err)
+	}
+	if math.Abs(float64(o-approx)) > 1000000 {
+		t.Error("unexpected", o)
+	}
+
+	approx = time.Now().UnixNano()
+	o, err = sa("topic1", 0, approx, cl)
+	t.Logf("StartingOffset(100) -> %d", o)
 	if err != nil {
 		t.Error(err)
 	}
@@ -45,6 +68,7 @@ func TestNoOlderThan1Minute(t *testing.T) {
 
 	approx = time.Now().Add(-time.Minute).UnixNano()
 	o, err = ooor("topic1", 0, cl)
+	t.Logf("OffsetOutOfRange() -> %d", o)
 	if err != nil {
 		t.Error(err)
 	}
@@ -54,9 +78,8 @@ func TestNoOlderThan1Minute(t *testing.T) {
 }
 
 // a fake sarama.Client which maps time -> offsets using time
-type fakeClient struct{}
+type fakeClient struct{ t *testing.T }
 
-func (*fakeClient) Config() *sarama.Config                                         { return nil }
 func (*fakeClient) Brokers() []*sarama.Broker                                      { return nil }
 func (*fakeClient) Topics() ([]string, error)                                      { return nil, nil }
 func (*fakeClient) Partitions(topic string) ([]int32, error)                       { return nil, nil }
@@ -69,6 +92,12 @@ func (*fakeClient) RefreshCoordinator(consumerGroup string) error               
 func (*fakeClient) Close() error                                                   { return nil }
 func (*fakeClient) Closed() bool                                                   { return false }
 
-func (*fakeClient) GetOffset(topic string, partition int32, ts_msec int64) (int64, error) {
-	return time.Unix(ts_msec/1000, (ts_msec%1000)*1000000).UnixNano(), nil
+func (cl *fakeClient) GetOffset(topic string, partition int32, ts_msec int64) (int64, error) {
+	offset := time.Unix(ts_msec/1000, (ts_msec%1000)*1000000).UnixNano()
+	cl.t.Logf("GetOffset(%q,%d,%d) -> %d", topic, partition, ts_msec, offset)
+	return offset, nil
+}
+func (*fakeClient) Config() *sarama.Config {
+	cfg := sarama.NewConfig()
+	return cfg
 }
