@@ -20,7 +20,7 @@ import (
 )
 
 const logging = true        // set to true to see log messages
-const debug = true          // set to true to see debug messages
+const debug = false         // set to true to see debug messages
 const per_msg_debug = false // set to true to see per-message debug messages
 
 // low level logging function. Replace it with your own if desired before making any calls to the rest of the API
@@ -179,9 +179,10 @@ func NewClient(group_name string, config *Config, sarama_client sarama.Client) (
 
 		errors: make(chan error),
 
-		closed:       make(chan struct{}),
-		add_consumer: make(chan add_consumer),
-		rem_consumer: make(chan *consumer),
+		closed:             make(chan struct{}),
+		add_consumer:       make(chan add_consumer),
+		rem_consumer:       make(chan *consumer),
+		sidechannel_commit: make(chan map[string][]SidechannelOffset),
 	}
 
 	// start the client's manager goroutine
@@ -293,6 +294,8 @@ type client struct {
 
 	add_consumer chan add_consumer // command channel used to add a new consumer
 	rem_consumer chan *consumer    // command channel used to remove an existing consumer
+
+	sidechannel_commit chan map[string][]SidechannelOffset // command channel used to commit to the sidechannel
 }
 
 // Errors returns the channel over which asynchronous errors are observed.
@@ -407,7 +410,6 @@ func (cl *client) run(early_rc chan<- error) {
 		close(cl.errors)
 	}
 	// commitToSidechannel trys to send the partition offsets to the SidechannelTopic
-	var producer sarama.AsyncProducer
 	commitToSidechannel := func() {
 		dbgf("commitToSidechannel()")
 
@@ -436,50 +438,8 @@ func (cl *client) run(early_rc chan<- error) {
 				Offset:    r.offset,
 			})
 		}
-		if len(offsets) == 0 {
-			// no offsets to commit
-			return
-		}
 
-		var err error
-		if producer == nil {
-			// create the side-channel producer now
-			producer, err = sarama.NewAsyncProducerFromClient(cl.client)
-			if err != nil {
-				cl.deliverError("creating side-channel producer", err)
-				producer = nil // paranoia
-				return
-			}
-			// start draining and logging errors from this producer until it closes
-			go func(producer sarama.AsyncProducer) {
-				for range producer.Successes() {
-					// toss
-				}
-			}(producer)
-			go func(producer sarama.AsyncProducer) {
-				for err := range producer.Errors() {
-					cl.deliverError("send to side-channel producer", err)
-				}
-			}(producer)
-		}
-		// construct the message
-		var msg = SidechannelMsg{
-			Ver:           1,
-			ConsumerGroup: cl.group_name,
-			Offsets:       offsets,
-		}
-		// should we use JSON or some faster/smaller encoding like Gob or protobuf? JSON for now until it is clear it is a problem.
-		data, err := json.Marshal(msg)
-		if err != nil {
-			cl.deliverError("marshaling SidechannelMsg", err)
-			return
-		}
-		dbgf("sending offsets to side-channel topic %q", cl.config.SidechannelTopic)
-		producer.Input() <- &sarama.ProducerMessage{
-			Topic: cl.config.SidechannelTopic,
-			Key:   sarama.StringEncoder(cl.group_name),
-			Value: sarama.ByteEncoder(data),
-		}
+		cl.sidechannel_commit <- offsets
 	}
 
 	// if enabled, subscribe to the side-channel topic on the appropriate partition
@@ -894,6 +854,7 @@ join_loop:
 				if err != nil {
 					cl.deliverError("committing offsets to "+coor.Addr(), err)
 					reopen = true
+					try_sidechannel = true
 				} else {
 					var prev_kerr sarama.KError // don't print the same error over and over. usually the same error will happen to all partitions
 					for topic, partitions := range ocresp.Errors {
@@ -980,6 +941,9 @@ type sidechannel_offset struct {
 	offset int64
 }
 
+// consume from the sidechannel and keep a local table of what is learned. since cl.group_key is used to select
+// the partition to which all members of this consumer group commit, we only need to consume from that one topic
+// and produce to the sidechannel when asked
 func (cl *client) sidechannel(topic string, queries <-chan sidechannel_query, ready chan<- struct{}) {
 	dbgf("sidechannel(%q)", topic)
 	defer dbgf("sidechannel(%q) exiting", topic)
@@ -1063,6 +1027,64 @@ func (cl *client) sidechannel(topic string, queries <-chan sidechannel_query, re
 		ready = nil
 	}
 
+	var producer sarama.AsyncProducer
+	defer func() {
+		if producer != nil {
+			producer.Close()
+		}
+	}()
+
+	// send offsets to the sidechannel
+	send := func(offsets map[string][]SidechannelOffset) {
+		if len(offsets) == 0 {
+			// no offsets to commit
+			return
+		}
+
+		var err error
+		if producer == nil {
+			// create the side-channel producer now
+			producer, err = sarama.NewAsyncProducerFromClient(cl.client)
+			if err != nil {
+				cl.deliverError("creating side-channel producer", err)
+				producer = nil // paranoia
+				return
+			}
+			// start draining and logging errors from this producer until it closes
+			go func(producer sarama.AsyncProducer) {
+				for range producer.Successes() {
+					// toss
+				}
+			}(producer)
+			go func(producer sarama.AsyncProducer) {
+				for err := range producer.Errors() {
+					cl.deliverError("send to side-channel producer", err)
+				}
+			}(producer)
+		}
+
+		// construct the message
+		var msg = SidechannelMsg{
+			Ver:           1,
+			ConsumerGroup: cl.group_name,
+			Offsets:       offsets,
+		}
+
+		// TODO should we use JSON or some faster/smaller encoding like Gob or protobuf? JSON for now until it is clear it is a problem.
+		data, err := json.Marshal(msg)
+		if err != nil {
+			cl.deliverError("marshaling SidechannelMsg", err)
+			return
+		}
+
+		dbgf("sending offsets to side-channel topic %q", cl.config.SidechannelTopic)
+		producer.Input() <- &sarama.ProducerMessage{
+			Topic: cl.config.SidechannelTopic,
+			Key:   sarama.StringEncoder(cl.group_name),
+			Value: sarama.ByteEncoder(data),
+		}
+	}
+
 	our_key := []byte(cl.group_name)
 	dbgf("sidechannel msgs %v", msgs)
 	dbgf("sidechannel errors %v", errors)
@@ -1133,6 +1155,10 @@ loop:
 			}
 			close(q.reply)
 			dbgf("sidechannel query answered")
+
+		case offsets := <-cl.sidechannel_commit:
+			send(offsets)
+
 		}
 	}
 }
@@ -1270,6 +1296,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		if clconfig.Consumer.Offsets.Retention == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
 			ocreq.RetentionTime = -1 // use broker's value
 		}
+		var sidechannel_offsets = make([]SidechannelOffset, 0, len(removed))
 		for _, p := range removed {
 			// stop consuming from partition p
 			if part, ok := partitions[p]; ok {
@@ -1287,6 +1314,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 				}
 				dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
 				ocreq.AddBlock(con.topic, p, offset, 0, "")
+				sidechannel_offsets = append(sidechannel_offsets, SidechannelOffset{p, offset})
 				logf("consumer %q stopped consuming %q partition %d at offset %d", con.cl.group_name, con.topic, p, offset)
 			}
 		}
@@ -1294,8 +1322,10 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		ocresp, err := coor.CommitOffset(ocreq)
 		dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
 		// log any errors we got. there isn't much we can do about them; the next consumer will start at an older offset
+		try_sidechannel := false
 		if err != nil {
 			con.deliverError("committing offsets", -1, err)
+			try_sidechannel = true
 		} else {
 			var prev_kerr sarama.KError // don't print the same error over and over. usually the same error will happen to all partitions
 			for _, partitions := range ocresp.Errors {
@@ -1307,9 +1337,16 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 						} else {
 							dbgf("same error committing offset of topic %q partition %d", con.topic, p, kerr)
 						}
+						switch kerr {
+						case sarama.ErrIllegalGeneration, sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
+							try_sidechannel = true
+						}
 					}
 				}
 			}
+		}
+		if try_sidechannel {
+			con.cl.sidechannel_commit <- map[string][]SidechannelOffset{con.topic: sidechannel_offsets}
 		}
 	}
 
