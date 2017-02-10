@@ -420,7 +420,7 @@ func (cl *client) run(early_rc chan<- error) {
 	} // else leave sidechannel_queries nil
 
 	// always start the producer, even if it is just a dummy routine that drains and throws away msgs in cl.sidechannel_commit
-	go cl.sidechannel_producer(topic)
+	go cl.sidechannel_producer(cl.config.SidechannelTopic)
 
 	// commitToSidechannel trys to send the partition offsets to the SidechannelTopic
 	commitToSidechannel := func() {
@@ -1004,7 +1004,7 @@ func (cl *client) sidechannel_consumer(topic string, queries <-chan sidechannel_
 			}
 			partition = parts[p1]
 		}
-		dbgf("sidechannel consuming %q partition %d", topic, partition)
+		logf("consumer %q sidechannel consuming %q partition %d", cl.group_name, topic, partition)
 
 		pconsumer, err := sconsumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
 		if err != nil {
@@ -1158,6 +1158,7 @@ func (cl *client) sidechannel_consumer(topic string, queries <-chan sidechannel_
 }
 
 // produce to the sidechannel partition when asked
+// if topic == "" then silently throw away any requests to produce
 func (cl *client) sidechannel_producer(topic string) {
 	dbgf("sidechannel_producer(%q)", topic)
 	defer dbgf("sidechannel_producer(%q) exiting", topic)
@@ -1190,7 +1191,7 @@ func (cl *client) sidechannel_producer(topic string) {
 			// no offsets to commit
 			return
 		}
-		if cl.config.SidechannelTopic == "" {
+		if topic == "" {
 			// no side-channel is configured
 			return
 		}
@@ -1204,6 +1205,9 @@ func (cl *client) sidechannel_producer(topic string) {
 				producer = nil // paranoia
 				return
 			}
+			logf("consumer %q sidechannel producing to %q", cl.group_name, topic)
+
+			// start consuming any async errors
 			perrors = producer.Errors()
 
 			// and if they are enabled, drain and throw away successes
