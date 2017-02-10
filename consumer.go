@@ -409,6 +409,19 @@ func (cl *client) run(early_rc chan<- error) {
 		// and shutdown the errors channel
 		close(cl.errors)
 	}
+
+	// if enabled, subscribe to the side-channel topic on the appropriate partition
+	var sidechannel_queries chan sidechannel_query // nil, or command channel used to request offsets from sidechannel
+	if topic := cl.config.SidechannelTopic; topic != "" {
+		sidechannel_queries = make(chan sidechannel_query)
+		ready := make(chan struct{})
+		go cl.sidechannel_consumer(topic, sidechannel_queries, ready)
+		<-ready // wait until sidechannel subscription is ready, since we want to capture the sidechannel msgs we will trigger by our join-group request
+	} // else leave sidechannel_queries nil
+
+	// always start the producer, even if it is just a dummy routine that drains and throws away msgs in cl.sidechannel_commit
+	go cl.sidechannel_producer(topic)
+
 	// commitToSidechannel trys to send the partition offsets to the SidechannelTopic
 	commitToSidechannel := func() {
 		dbgf("commitToSidechannel()")
@@ -441,15 +454,6 @@ func (cl *client) run(early_rc chan<- error) {
 
 		cl.sidechannel_commit <- offsets
 	}
-
-	// if enabled, subscribe to the side-channel topic on the appropriate partition
-	var sidechannel_queries chan sidechannel_query
-	if topic := cl.config.SidechannelTopic; topic != "" {
-		sidechannel_queries = make(chan sidechannel_query)
-		ready := make(chan struct{})
-		go cl.sidechannel(topic, sidechannel_queries, ready)
-		<-ready // wait until sidechannel subscription is ready, since we want to capture the sidechannel msgs we will trigger by our join-group request
-	} // else leave sidechannel_queries nil
 
 	// start the commit timer
 	var commit_timer <-chan time.Time
@@ -943,12 +947,13 @@ type sidechannel_offset struct {
 
 // consume from the sidechannel and keep a local table of what is learned. since cl.group_key is used to select
 // the partition to which all members of this consumer group commit, we only need to consume from that one topic
-// and produce to the sidechannel when asked
-func (cl *client) sidechannel(topic string, queries <-chan sidechannel_query, ready chan<- struct{}) {
-	dbgf("sidechannel(%q)", topic)
-	defer dbgf("sidechannel(%q) exiting", topic)
+func (cl *client) sidechannel_consumer(topic string, queries <-chan sidechannel_query, ready chan<- struct{}) {
+	dbgf("sidechannel_consumer(%q)", topic)
+	defer dbgf("sidechannel_consumer(%q) exiting", topic)
 	// local table of {topic,partition} -> offset
 	offsets := make(map[sidechannel_key]int64)
+	// our kafka msg key
+	our_key := []byte(cl.group_name)
 
 	// consume from the appropriate partition of our side channel
 	start := func() (sarama.Consumer, sarama.PartitionConsumer) { // func just to have a nice clean way to return out of error conditions
@@ -1010,22 +1015,154 @@ func (cl *client) sidechannel(topic string, queries <-chan sidechannel_query, re
 		return sconsumer, pconsumer
 	}
 
-	sidechannel_consumer, sidechannel_partition_consumer := start()
-	if sidechannel_consumer != nil {
-		defer sidechannel_consumer.Close()
-	}
-	var msgs <-chan *sarama.ConsumerMessage
-	var errors <-chan *sarama.ConsumerError
-	if sidechannel_partition_consumer != nil {
-		defer sidechannel_partition_consumer.Close()
-		msgs = sidechannel_partition_consumer.Messages()
-		errors = sidechannel_partition_consumer.Errors()
-	}
+	var sconsumer sarama.Consumer
+	var pconsumer sarama.PartitionConsumer
+	// make sure we close things on the way out
+	defer func() {
+		if pconsumer != nil {
+			pconsumer.Close()
+		}
+		if sconsumer != nil {
+			sconsumer.Close()
+		}
+	}()
 
-	if ready != nil {
-		close(ready)
-		ready = nil
+	for {
+		sconsumer, pconsumer = start()
+		var msgs <-chan *sarama.ConsumerMessage
+		var errors <-chan *sarama.ConsumerError
+
+		var retry <-chan time.Time // nil, or timer indicating when to attempt to reconnect to kafka
+		if pconsumer == nil {
+			if sconsumer != nil {
+				sconsumer.Close()
+				sconsumer = nil
+			}
+			if topic != "" {
+				// try again after a short pause
+				retry = time.After(cl.client.Config().Consumer.Retry.Backoff)
+			} // else sidechannel use is disabled and we're just going to stuck around to return any requests without any responses
+		}
+
+		if pconsumer != nil {
+			msgs = pconsumer.Messages()
+			errors = pconsumer.Errors()
+		}
+
+		if ready != nil {
+			close(ready)
+			ready = nil
+		}
+
+	msg_loop:
+		for {
+			select {
+			case <-retry:
+				// retry connecting to kafka
+				break msg_loop
+
+			case <-cl.closed:
+				dbgf("sidechannel client closed")
+				// consumer is shutting down; let the defers do the cleanup
+				return
+
+			case err, ok := <-errors:
+				dbgf("sidechannel consumer error %v, %v", err, ok)
+				if !ok {
+					errors = nil
+					break
+				}
+				cl.deliverError("consuming side-channel topic "+topic, err)
+				// disconnect and reconnect to broker
+				break msg_loop
+
+			case kmsg, ok := <-msgs:
+				//dbgf("sidechannel msg %v, %v", kmsg, ok)
+				if !ok {
+					msgs = nil
+					break
+				}
+				if !bytes.Equal(kmsg.Key, our_key) {
+					// ignore the msg; it belongs to a different consumer group
+					//dbgf("sidechannel ignore; key %q != %q", kmsg.Key, our_key)
+					continue msg_loop
+				}
+				// decode the msg
+				var msg SidechannelMsg
+				err := json.Unmarshal(kmsg.Value, &msg)
+				if err != nil {
+					cl.deliverError("unmarshaling  side-channel msg", err)
+					continue msg_loop
+				}
+				//dbgf("sidechannel msg %v", msg)
+				if msg.Ver != 1 {
+					cl.deliverError("", fmt.Errorf("unknown SidechannelMsg version %d", msg.Ver))
+					continue msg_loop
+				}
+
+				// save/update the offsets in our local table
+				for topic, topic_offsets := range msg.Offsets {
+					for i := range topic_offsets {
+						to := &topic_offsets[i]
+						// record any new, gt offsets
+						key := sidechannel_key{topic, to.Partition}
+						o := offsets[key] // note zero-value works out fine
+						if to.Offset > o {
+							//dbgf("sidechannel noting %+v > %d", to, o)
+							offsets[key] = to.Offset
+						} else {
+							//dbgf("sidechannel ignoring %+v <= %d", to, o)
+						}
+					}
+				}
+
+			case q := <-queries:
+				//dbgf("sidechannel query %+v", q)
+				// look through the request and send back any we have, then close the reply channel to indicate we're done
+				for _, key := range q.queries {
+					o, ok := offsets[key]
+					if ok {
+						//dbgf("sidechannel replying %+v", sidechannel_offset{key, o})
+						q.reply <- sidechannel_offset{key, o}
+					}
+				}
+				close(q.reply)
+			}
+		}
+
+		// drain and throw away whatever is left in current consumer's errors and msgs
+		if errors != nil {
+			go func(errors <-chan *sarama.ConsumerError) {
+				for err := range errors {
+					dbgf("tossing stale side-channel error %v", err)
+				}
+			}(errors)
+		}
+		if msgs != nil {
+			go func(msgs <-chan *sarama.ConsumerMessage) {
+				for range msgs {
+					// toss (too bad)
+				}
+			}(msgs)
+		}
+
+		if pconsumer != nil {
+			pconsumer.Close()
+			pconsumer = nil
+		}
+		if sconsumer != nil {
+			sconsumer.Close()
+			sconsumer = nil
+		}
 	}
+}
+
+// produce to the sidechannel partition when asked
+func (cl *client) sidechannel_producer(topic string) {
+	dbgf("sidechannel_producer(%q)", topic)
+	defer dbgf("sidechannel_producer(%q) exiting", topic)
+
+	our_key := []byte(cl.group_name)
 
 	var producer sarama.AsyncProducer
 	defer func() {
@@ -1034,10 +1171,27 @@ func (cl *client) sidechannel(topic string, queries <-chan sidechannel_query, re
 		}
 	}()
 
-	// send offsets to the sidechannel
+	var perrors <-chan *sarama.ProducerError
+	defer func() {
+		if perrors != nil {
+			// drain any and all remaining errors
+			go func(perrors <-chan *sarama.ProducerError) {
+				for range perrors {
+					// toss error
+				}
+			}(perrors)
+		}
+	}()
+
+	// send offsets to the sidechannel (as a function since returning from
+	// error conditions makes the code easier to read than breaking out of case statements)
 	send := func(offsets map[string][]SidechannelOffset) {
 		if len(offsets) == 0 {
 			// no offsets to commit
+			return
+		}
+		if cl.config.SidechannelTopic == "" {
+			// no side-channel is configured
 			return
 		}
 
@@ -1050,17 +1204,17 @@ func (cl *client) sidechannel(topic string, queries <-chan sidechannel_query, re
 				producer = nil // paranoia
 				return
 			}
-			// start draining and logging errors from this producer until it closes
-			go func(producer sarama.AsyncProducer) {
-				for range producer.Successes() {
-					// toss
-				}
-			}(producer)
-			go func(producer sarama.AsyncProducer) {
-				for err := range producer.Errors() {
-					cl.deliverError("send to side-channel producer", err)
-				}
-			}(producer)
+			perrors = producer.Errors()
+
+			// and if they are enabled, drain and throw away successes
+			if cl.client.Config().Producer.Return.Successes {
+				// start draining successes from this producer until it closes
+				go func(producer sarama.AsyncProducer) {
+					for range producer.Successes() {
+						// toss
+					}
+				}(producer)
+			}
 		}
 
 		// construct the message
@@ -1080,85 +1234,34 @@ func (cl *client) sidechannel(topic string, queries <-chan sidechannel_query, re
 		dbgf("sending offsets to side-channel topic %q", cl.config.SidechannelTopic)
 		producer.Input() <- &sarama.ProducerMessage{
 			Topic: cl.config.SidechannelTopic,
-			Key:   sarama.StringEncoder(cl.group_name),
+			Key:   sarama.ByteEncoder(our_key),
 			Value: sarama.ByteEncoder(data),
 		}
 	}
 
-	our_key := []byte(cl.group_name)
-	dbgf("sidechannel msgs %v", msgs)
-	dbgf("sidechannel errors %v", errors)
-	dbgf("sidechannel our_key %q", our_key)
-loop:
 	for {
 		select {
 		case <-cl.closed:
-			dbgf("sidechannel client closed")
-			// consumer is shutting down
+			dbgf("sidechannel producer closed")
+			// consumer is shutting down; let the defers do the cleanup
 			return
-		case err, ok := <-errors:
-			dbgf("sidechannel error %v, %v", err, ok)
-			if !ok {
-				break loop
-			}
-			cl.deliverError("consuming side-channel topic "+topic, err)
-			// TODO close and reconnect? Keep going?
-
-		case kmsg, ok := <-msgs:
-			dbgf("sidechannel msg %v, %v", kmsg, ok)
-			if !ok {
-				break loop
-			}
-			if !bytes.Equal(kmsg.Key, our_key) {
-				// ignore the msg; it belongs to a different consumer group
-				dbgf("sidechannel ignore; key %q != %q", kmsg.Key, our_key)
-				continue
-			}
-			// decode the msg
-			var msg SidechannelMsg
-			err := json.Unmarshal(kmsg.Value, &msg)
-			if err != nil {
-				cl.deliverError("unmarshaling  side-channel msg", err)
-				continue
-			}
-			dbgf("sidechannel msg %v", msg)
-			if msg.Ver != 1 {
-				cl.deliverError("", fmt.Errorf("unknown SidechannelMsg version %d", msg.Ver))
-				continue
-			}
-
-			// save/update the offsets in our local table
-			for topic, topic_offsets := range msg.Offsets {
-				for i := range topic_offsets {
-					to := &topic_offsets[i]
-					// record any new, gt offsets
-					key := sidechannel_key{topic, to.Partition}
-					o := offsets[key] // note zero-value works out fine
-					if to.Offset > o {
-						dbgf("sidechannel noting %+v > %d", to, o)
-						offsets[key] = to.Offset
-					} else {
-						dbgf("sidechannel ignoring %+v <= %d", to, o)
-					}
-				}
-			}
-
-		case q := <-queries:
-			dbgf("sidechannel query %+v", q)
-			// look through the request and send back any we have, then close the reply channel to indicate we're done
-			for _, key := range q.queries {
-				o, ok := offsets[key]
-				if ok {
-					dbgf("sidechannel replying %+v", sidechannel_offset{key, o})
-					q.reply <- sidechannel_offset{key, o}
-				}
-			}
-			close(q.reply)
-			dbgf("sidechannel query answered")
 
 		case offsets := <-cl.sidechannel_commit:
 			send(offsets)
 
+		case err, ok := <-perrors:
+			dbgf("sidechannel producer error %v, %v", err, ok)
+			if !ok {
+				perrors = nil
+				break
+			}
+			cl.deliverError("producing to side-channel topic "+topic, err)
+			// close the producer; we'll reopen it when we need it again
+			if producer != nil {
+				producer.Close()
+				producer = nil
+				perrors = nil
+			}
 		}
 	}
 }
