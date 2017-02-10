@@ -1101,7 +1101,7 @@ loop:
 			if !ok {
 				break loop
 			}
-			cl.deliverError("error consuming side-channel topic "+topic, err)
+			cl.deliverError("consuming side-channel topic "+topic, err)
 			// TODO close and reconnect? Keep going?
 
 		case kmsg, ok := <-msgs:
@@ -1118,12 +1118,12 @@ loop:
 			var msg SidechannelMsg
 			err := json.Unmarshal(kmsg.Value, &msg)
 			if err != nil {
-				cl.deliverError("error unmarshaling  side-channel msg", err)
+				cl.deliverError("unmarshaling  side-channel msg", err)
 				continue
 			}
 			dbgf("sidechannel msg %v", msg)
 			if msg.Ver != 1 {
-				cl.deliverError("", fmt.Errorf("Unknown SidechannelMsg version %d", msg.Ver))
+				cl.deliverError("", fmt.Errorf("unknown SidechannelMsg version %d", msg.Ver))
 				continue
 			}
 
