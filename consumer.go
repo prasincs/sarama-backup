@@ -112,8 +112,9 @@ type Config struct {
 	// is passed in. An implementation might want to return client.Config().Consumer.Offsets.Initial in that case.
 	StartingOffset StartingOffset
 
-	// kafka topic used to exchange partition offsets between dying and rebalancing consumers. Defaults to "sarama-consumer-sidechannel-offsets"
-	// If "" then this feature is disabled, and consumers can rewind as much as Config.Rebalance.Timeout + sarama.Config.Offset.CommitInterval
+	// SidechannelOffset is a kafka topic used to exchange partition offsets between dying and rebalancing consumers.
+	// It defaults to "sarama-consumer-sidechannel-offsets".  If SidechannelTopic is "" then this feature is disabled,
+	// and consumers can rewind as much as Config.Rebalance.Timeout + sarama.Config.Offset.CommitInterval
 	// when a partition is reassigned. That's always possible (kafka only promises at-least-once), but in high frequency
 	// topics rewinding the default 30 seconds creates a measureable burst).
 	// We can't comit offsets normally during a rebalance because at that point in time we still belong to the old generation,
@@ -414,9 +415,17 @@ func (cl *client) run(early_rc chan<- error) {
 	var sidechannel_queries chan sidechannel_query // nil, or command channel used to request offsets from sidechannel
 	if topic := cl.config.SidechannelTopic; topic != "" {
 		sidechannel_queries = make(chan sidechannel_query)
-		ready := make(chan struct{})
+		ready := make(chan error)
 		go cl.sidechannel_consumer(topic, sidechannel_queries, ready)
-		<-ready // wait until sidechannel subscription is ready, since we want to capture the sidechannel msgs we will trigger by our join-group request
+		// want and log errors until sidechannel subscription is ready, since we want to capture the sidechannel msgs we will trigger by our join-group request
+		for err := range ready {
+			err = cl.makeError(fmt.Sprintf("consuming SidechannelTopic %q", topic), err)
+			if early_rc != nil {
+				early_rc <- err
+				return
+			}
+			cl.deliverError("", err)
+		}
 	} // else leave sidechannel_queries nil
 
 	// always start the producer, even if it is just a dummy routine that drains and throws away msgs in cl.sidechannel_commit
@@ -947,13 +956,26 @@ type sidechannel_offset struct {
 
 // consume from the sidechannel and keep a local table of what is learned. since cl.group_key is used to select
 // the partition to which all members of this consumer group commit, we only need to consume from that one topic
-func (cl *client) sidechannel_consumer(topic string, queries <-chan sidechannel_query, ready chan<- struct{}) {
+func (cl *client) sidechannel_consumer(topic string, queries <-chan sidechannel_query, ready chan<- error) {
 	dbgf("sidechannel_consumer(%q)", topic)
 	defer dbgf("sidechannel_consumer(%q) exiting", topic)
 	// local table of {topic,partition} -> offset
 	offsets := make(map[sidechannel_key]int64)
 	// our kafka msg key
 	our_key := []byte(cl.group_name)
+
+	// deliver errors to ready when we are starting up, or to cl.Errors later on
+	deliverError := func(msg string, err error) {
+		err = cl.makeError(msg, err)
+		if ready != nil {
+			select {
+			case ready <- err:
+			case <-cl.closed:
+			}
+		} else {
+			cl.deliverError("", err)
+		}
+	}
 
 	// consume from the appropriate partition of our side channel
 	start := func() (sarama.Consumer, sarama.PartitionConsumer) { // func just to have a nice clean way to return out of error conditions
@@ -964,13 +986,13 @@ func (cl *client) sidechannel_consumer(topic string, queries <-chan sidechannel_
 		}
 		sconsumer, err := sarama.NewConsumerFromClient(cl.client)
 		if err != nil {
-			cl.deliverError("creating sarama consumer", err)
+			deliverError("creating sarama consumer", err)
 			return nil, nil
 		}
-		dbgf("sidechannel got sconsumer")
+		dbgf("sidechannel got consumer")
 		parts, err := sconsumer.Partitions(topic)
 		if err != nil {
-			cl.deliverError("listing partitions of side-channel topic "+topic, err)
+			deliverError("listing partitions of side-channel topic "+topic, err)
 			return sconsumer, nil
 		}
 		dbgf("sidechannel got partitions %v", parts)
@@ -988,18 +1010,18 @@ func (cl *client) sidechannel_consumer(topic string, queries <-chan sidechannel_
 			}
 			p1, err := parter.Partition(test_msg, int32(len(parts)))
 			if err != nil {
-				cl.deliverError("can't pick a partition in side-channel topic "+topic, err)
+				deliverError("can't pick a partition in side-channel topic "+topic, err)
 				return sconsumer, nil
 			}
 			// try it again, to flush out round-robin style partitioners used by accident
 			p2, err := parter.Partition(test_msg, int32(len(parts)))
 			if err != nil {
-				cl.deliverError("can't pick a partition in side-channel topic "+topic, err)
+				deliverError("can't pick a partition in side-channel topic "+topic, err)
 				return sconsumer, nil
 			}
 			dbgf("sidechannel got partition responses %v, %v", p1, p2)
 			if p1 != p2 {
-				cl.deliverError("", fmt.Errorf("partitioning is inconsistent in side-channel topic %q", topic))
+				deliverError("", fmt.Errorf("partitioning is inconsistent in side-channel topic %q", topic))
 				return sconsumer, nil
 			}
 			partition = parts[p1]
@@ -1008,7 +1030,7 @@ func (cl *client) sidechannel_consumer(topic string, queries <-chan sidechannel_
 
 		pconsumer, err := sconsumer.ConsumePartition(topic, partition, sarama.OffsetNewest)
 		if err != nil {
-			cl.deliverError(fmt.Sprintf("consuming side-channel partition %d of %s", partition, topic), err)
+			deliverError(fmt.Sprintf("consuming side-channel partition %d of %s", partition, topic), err)
 			return sconsumer, nil
 		}
 		dbgf("sidechannel got partition consumer %v", pconsumer)
@@ -1287,7 +1309,10 @@ func (cl *client) deliverError(context string, err error) {
 		err = cl.makeError(context, err)
 	}
 	logf("%v", err)
-	cl.errors <- err
+	select {
+	case cl.errors <- err:
+	case <-cl.closed:
+	}
 }
 
 // consumer implements the Consumer interface
