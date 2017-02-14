@@ -1,0 +1,206 @@
+/*
+  Unit tests using a mocked sarama.Client
+
+  Copyright 2017 MistSys
+*/
+
+package consumer_test
+
+import (
+	"sync"
+	"testing"
+
+	"github.com/Shopify/sarama"
+	consumer "github.com/mistsys/sarama-consumer"
+)
+
+// NewClient().Close()
+func TestClientCreateClose(t *testing.T) {
+	// create a consumer
+	sconfig := sarama.NewConfig()
+	sclient := &mockClient{
+		config: sconfig,
+		partitions: map[string][]int32{
+			"sarama-consumer-sidechannel-offsets": []int32{0, 1, 2},
+		},
+	}
+
+	config := consumer.NewConfig()
+
+	client, err := consumer.NewClient("group", config, sclient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(errors <-chan error) {
+		for err := range errors {
+			t.Error(err)
+		}
+		wg.Done()
+	}(client.Errors())
+
+	client.Close()
+	wg.Wait()
+}
+
+// NewClient() when sidechannel topic does not exist and is not "" in config should cause an error
+func TestClientSidechannelTopicNotCreated(t *testing.T) {
+	// create a consumer
+	sconfig := sarama.NewConfig()
+	sclient := &mockClient{
+		config: sconfig,
+		// no topics on the simulated kafka
+	}
+
+	config := consumer.NewConfig()
+
+	client, err := consumer.NewClient("group", config, sclient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(errors <-chan error) {
+		for err := range errors {
+			t.Log(err)
+		}
+		wg.Done()
+	}(client.Errors())
+
+	client.Close()
+	wg.Wait()
+}
+
+func TestConsumerCreateClose(t *testing.T) {
+	// create a consumer
+	sconfig := sarama.NewConfig()
+	sclient := &mockClient{
+		config: sconfig,
+		partitions: map[string][]int32{
+			"topic1": []int32{0, 1, 2},
+		},
+	}
+
+	config := consumer.NewConfig()
+
+	client, err := consumer.NewClient("group", config, sclient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func(errors <-chan error) {
+		for err := range errors {
+			t.Error(err)
+		}
+	}(client.Errors())
+
+	con, err := client.Consume("nonexistant-topic")
+	if err == nil {
+		t.Fatal("Consuming non-existant topic should have failed")
+	}
+
+	con, err = client.Consume("topic1")
+	if err != nil {
+		t.Error(err)
+	}
+	if con == nil {
+		t.Error("no consumer")
+	} else {
+		// immediately close down
+		con.Close()
+	}
+
+	client.Close()
+	wg.Wait()
+}
+
+// mock sarama.Client which implements the metadata API sufficiently for our unit test purposes
+type mockClient struct {
+	config     *sarama.Config
+	partitions map[string][]int32
+}
+
+func (mc *mockClient) Brokers() []*sarama.Broker {
+	return nil
+}
+
+func (mc *mockClient) Config() *sarama.Config {
+	return mc.config
+}
+
+func (mc *mockClient) Topics() ([]string, error) {
+	var topics = make([]string, 0, len(mc.partitions))
+	for t := range mc.partitions {
+		topics = append(topics, t)
+	}
+	return topics, nil
+}
+
+func (mc *mockClient) Partitions(topic string) ([]int32, error) {
+	if p, ok := mc.partitions[topic]; ok {
+		return p, nil
+	}
+	return nil, sarama.ErrUnknownTopicOrPartition
+}
+
+func (mc *mockClient) WritablePartitions(topic string) ([]int32, error) {
+	return mc.Partitions(topic)
+}
+
+func (mc *mockClient) Leader(topic string, part int32) (*sarama.Broker, error) {
+	return nil, sarama.ErrBrokerNotAvailable
+}
+
+func (mc *mockClient) Replicas(topic string, part int32) ([]int32, error) {
+	return nil, sarama.ErrNotEnoughReplicas
+}
+
+func (mc *mockClient) RefreshMetadata(topics ...string) error {
+	return nil
+}
+
+func (mc *mockClient) GetOffset(topic string, part int32, time int64) (int64, error) {
+	return 0, nil
+}
+
+func (mc *mockClient) Coordinator(group string) (*sarama.Broker, error) {
+	return nil, sarama.ErrBrokerNotAvailable
+}
+
+func (mc *mockClient) RefreshCoordinator(group string) error {
+	return nil
+}
+
+func (mc *mockClient) Close() error {
+	return nil
+}
+
+func (mc *mockClient) Closed() bool {
+	return false
+}
+
+// a sortable, comparible list of partition ids
+type partitionslist []int32 // a list of the partition ids
+
+// implement sort.Interface
+func (pl partitionslist) Len() int           { return len(pl) }
+func (pl partitionslist) Swap(i, j int)      { pl[i], pl[j] = pl[j], pl[i] }
+func (pl partitionslist) Less(i, j int) bool { return pl[i] < pl[j] }
+
+// and compare two sorted partitionslist for equality
+func (pl partitionslist) Equal(pl2 partitionslist) bool {
+	if len(pl) != len(pl2) {
+		return false
+	}
+	for i, m := range pl {
+		if m != pl2[i] {
+			return false
+		}
+	}
+	return true
+}
