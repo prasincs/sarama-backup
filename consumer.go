@@ -120,11 +120,16 @@ type Config struct {
 	// We can't comit offsets normally during a rebalance because at that point in time we still belong to the old generation,
 	// but the broker belongs to the new generation. Hence this side channel.
 	SidechannelTopic string
+
+	// AssignmentNotification is an optional callback to inform the client code whenever the client gets a new
+	// partition assignment.
+	AssignmentNotification AssignmentNotification
 }
 
 // types of the functions in the Config
 type StartingOffset func(topic string, partition int32, committed_offset int64, client sarama.Client) (offset int64, err error)
 type OffsetOutOfRange func(topic string, partition int32, client sarama.Client) (offset int64, err error)
+type AssignmentNotification func(assignments map[string][]int32) // assignments is a map from topic -> list of partitions
 
 // default implementation of Config.OffsetOutOfRange jumps to the current head of the partition.
 func DefaultOffsetOutOfRange(topic string, partition int32, client sarama.Client) (int64, error) {
@@ -735,6 +740,21 @@ join_loop:
 			num_assigned_partitions += len(parts)
 		}
 		logf("consumer %q assigned %d partitions; assignment: %v", cl.group_name, num_assigned_partitions, assignments)
+		if cl.config.AssignmentNotification != nil {
+			// keep users from thinking they can alter assignments in the callback by making a deep copy
+			acopy := make(map[string][]int32, len(assignments))
+			n := 0
+			for _, v := range assignments {
+				n += len(v)
+			}
+			parts := make([]int32, 0, n) // space for all the partitions slices (better for gc and for perf)
+			for k, v := range assignments {
+				n := len(parts)
+				parts := append(parts, v...)
+				acopy[k] = parts[n:]
+			}
+			cl.config.AssignmentNotification(acopy)
+		}
 
 		// save and distribute the new assignments to our topic consumers
 		a := &assignment{
