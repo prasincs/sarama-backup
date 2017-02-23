@@ -239,6 +239,8 @@ type Consumer interface {
 	// returns the same result, so it is safe to call once and store the result.
 	// Every message read from the channel should be passed to Done when processing
 	// of the message is complete.
+	// It is not necessary to call Done in the same order as messages are received
+	// from this channel.
 	Messages() <-chan *sarama.ConsumerMessage
 
 	// Done indicates the processing of the message is complete, and its offset can
