@@ -857,7 +857,10 @@ join_loop:
 			case <-commit_timer:
 				for _, con := range consumers {
 					select {
-					case c := <-con.commits_channel:
+					case c, ok := <-con.commits_channel:
+						if !ok {
+							break
+						}
 						dbgf("received %v on commits channel", c)
 						ocreq := &sarama.OffsetCommitRequest{
 							ConsumerGroup:           cl.group_name,
