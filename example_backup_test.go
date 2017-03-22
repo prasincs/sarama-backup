@@ -8,6 +8,7 @@ package consumer_test
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/Shopify/sarama"
@@ -16,7 +17,7 @@ import (
 	"github.com/prasincs/sarama-backup/stable"
 )
 
-func ExampleNewClient() {
+func ExampleNewBackupClient() {
 	// create a suitable sarama.Client
 	sconfig := sarama.NewConfig()
 	sconfig.Version = consumer.MinVersion // consumer requires at least 0.9
@@ -46,6 +47,7 @@ func ExampleNewClient() {
 	// process messages
 	for msg := range topic_consumer.Messages() {
 		fmt.Println("processing message", msg)
-		topic_consumer.Done(msg) // required
+		log.Println("Processing message", msg)
 	}
+	//Output: processing message: hello
 }

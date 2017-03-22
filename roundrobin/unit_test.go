@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/Shopify/sarama"
-	consumer "github.com/mistsys/sarama-consumer"
-	"github.com/mistsys/sarama-consumer/roundrobin"
+	consumer "github.com/prasincs/sarama-backup"
+	"github.com/prasincs/sarama-backup/roundrobin"
 )
 
 func TestRoundRobin(t *testing.T) {

@@ -16,11 +16,11 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
-	"github.com/mistsys/sarama-consumer/roundrobin"
+	"github.com/prasincs/sarama-backup/roundrobin"
 )
 
 const logging = true        // set to true to see log messages
-const debug = false         // set to true to see debug messages
+const debug = true          // set to true to see debug messages
 const per_msg_debug = false // set to true to see per-message debug messages
 
 // low level logging function. Replace it with your own if desired before making any calls to the rest of the API
@@ -122,7 +122,7 @@ type Config struct {
 	SidechannelTopic string
 
 	// AssignmentNotification is an optional callback to inform the client code whenever the client gets a new
-	// partition assignment.
+	// partition assignment.p
 	AssignmentNotification AssignmentNotification
 }
 
@@ -258,6 +258,8 @@ type Consumer interface {
 	// Close() terminates the consumer and waits for it to be finished committing the current
 	// offsets to kafka. Calling twice happens to work at the moment, but let's not encourage it.
 	Close()
+
+	Commit(topic string, partition int32, offset int64)
 }
 
 /*
@@ -335,6 +337,8 @@ func (cl *client) Consume(topic string) (Consumer, error) {
 
 		assignments: make(chan *assignment, 1),
 		commit_reqs: make(chan commit_req),
+
+		commits_channel: make(chan commit_resp),
 
 		restart_partitions: make(chan *partition),
 		premessages:        make(chan *sarama.ConsumerMessage, chanbufsize),
@@ -419,57 +423,57 @@ func (cl *client) run(early_rc chan<- error) {
 	}
 
 	// if enabled, subscribe to the side-channel topic on the appropriate partition
-	var sidechannel_queries chan sidechannel_query // nil, or command channel used to request offsets from sidechannel
-	if topic := cl.config.SidechannelTopic; topic != "" {
-		sidechannel_queries = make(chan sidechannel_query)
-		ready := make(chan error)
-		go cl.sidechannel_consumer(topic, sidechannel_queries, ready)
-		// want and log errors until sidechannel subscription is ready, since we want to capture the sidechannel msgs we will trigger by our join-group request
-		for err := range ready {
-			err = cl.makeError(fmt.Sprintf("consuming SidechannelTopic %q", topic), err)
-			if early_rc != nil {
-				early_rc <- err
-				return
-			}
-			cl.deliverError("", err)
-		}
-	} // else leave sidechannel_queries nil
+	// var sidechannel_queries chan sidechannel_query // nil, or command channel used to request offsets from sidechannel
+	// if topic := cl.config.SidechannelTopic; topic != "" {
+	// 	sidechannel_queries = make(chan sidechannel_query)
+	// 	ready := make(chan error)
+	// 	go cl.sidechannel_consumer(topic, sidechannel_queries, ready)
+	// 	// want and log errors until sidechannel subscription is ready, since we want to capture the sidechannel msgs we will trigger by our join-group request
+	// 	for err := range ready {
+	// 		err = cl.makeError(fmt.Sprintf("consuming SidechannelTopic %q", topic), err)
+	// 		if early_rc != nil {
+	// 			early_rc <- err
+	// 			return
+	// 		}
+	// 		cl.deliverError("", err)
+	// 	}
+	// } // else leave sidechannel_queries nil
 
 	// always start the producer, even if it is just a dummy routine that drains and throws away msgs in cl.sidechannel_commit
-	go cl.sidechannel_producer(cl.config.SidechannelTopic)
+	//go cl.sidechannel_producer(cl.config.SidechannelTopic)
 
-	// commitToSidechannel trys to send the partition offsets to the SidechannelTopic
-	commitToSidechannel := func() {
-		dbgf("commitToSidechannel()")
+	// // commitToSidechannel trys to send the partition offsets to the SidechannelTopic
+	// commitToSidechannel := func() {
+	// 	dbgf("commitToSidechannel()")
 
-		if cl.config.SidechannelTopic == "" {
-			// no side channel is configured
-			return
-		}
+	// 	if cl.config.SidechannelTopic == "" {
+	// 		// no side channel is configured
+	// 		return
+	// 	}
 
-		// gather up the offsets to commit
-		var wg sync.WaitGroup
-		resp := make(chan commit_resp)
-		for _, con := range consumers {
-			wg.Add(1)
-			con.commit_reqs <- commit_req{resp, &wg}
-		}
-		go func(resp chan commit_resp, wg *sync.WaitGroup) {
-			wg.Wait()
-			close(resp)
-		}(resp, &wg)
+	// 	// gather up the offsets to commit
+	// 	var wg sync.WaitGroup
+	// 	resp := make(chan commit_resp)
+	// 	for _, con := range consumers {
+	// 		wg.Add(1)
+	// 		con.commit_reqs <- commit_req{resp, &wg}
+	// 	}
+	// 	go func(resp chan commit_resp, wg *sync.WaitGroup) {
+	// 		wg.Wait()
+	// 		close(resp)
+	// 	}(resp, &wg)
 
-		var offsets = make(map[string][]SidechannelOffset)
-		for r := range resp {
-			dbgf("commit (%q, %d, %d)", r.topic, r.partition, r.offset)
-			offsets[r.topic] = append(offsets[r.topic], SidechannelOffset{
-				Partition: r.partition,
-				Offset:    r.offset,
-			})
-		}
+	// 	var offsets = make(map[string][]SidechannelOffset)
+	// 	for r := range resp {
+	// 		dbgf("commit (%q, %d, %d)", r.topic, r.partition, r.offset)
+	// 		offsets[r.topic] = append(offsets[r.topic], SidechannelOffset{
+	// 			Partition: r.partition,
+	// 			Offset:    r.offset,
+	// 		})
+	// 	}
 
-		cl.sidechannel_commit <- offsets
-	}
+	// 	cl.sidechannel_commit <- offsets
+	// }
 
 	// start the commit timer
 	var commit_timer <-chan time.Time
@@ -506,8 +510,8 @@ join_loop:
 					add(a)
 				case r := <-cl.rem_consumer:
 					rem(r)
-				case <-commit_timer:
-					commitToSidechannel()
+					//case <-commit_timer:
+					//commitToSidechannel()
 				}
 			}
 			pause = false
@@ -634,8 +638,8 @@ join_loop:
 			select {
 			case <-done:
 				break wait_for_jresp
-			case <-commit_timer:
-				commitToSidechannel()
+				//			case <-commit_timer:
+				//				commitToSidechannel()
 			}
 		}
 		if err != nil {
@@ -708,8 +712,8 @@ join_loop:
 			select {
 			case <-done:
 				break wait_for_sresp
-			case <-commit_timer:
-				commitToSidechannel()
+				//case <-commit_timer:
+				//	commitToSidechannel()
 			}
 		}
 		if err != nil {
@@ -760,11 +764,11 @@ join_loop:
 
 		// save and distribute the new assignments to our topic consumers
 		a := &assignment{
-			generation_id:       generation_id,
-			coordinator:         coor,
-			member_id:           member_id,
-			assignments:         assignments,
-			sidechannel_queries: sidechannel_queries,
+			generation_id: generation_id,
+			coordinator:   coor,
+			member_id:     member_id,
+			assignments:   assignments,
+			//sidechannel_queries: sidechannel_queries,
 		}
 		for _, con := range consumers {
 			select {
@@ -851,77 +855,96 @@ join_loop:
 				heartbeat_timer = time.After(cl.config.Heartbeat.Interval)
 
 			case <-commit_timer:
-				ocreq := &sarama.OffsetCommitRequest{
-					ConsumerGroup:           cl.group_name,
-					ConsumerGroupGeneration: generation_id,
-					ConsumerID:              member_id,
-					RetentionTime:           int64(clconfig.Consumer.Offsets.Retention / time.Millisecond),
-					Version:                 2, // kafka 0.9.0 version, with RetentionTime
-				}
-				if clconfig.Consumer.Offsets.Retention == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
-					ocreq.RetentionTime = -1 // use broker's value
-				}
-				var wg sync.WaitGroup
-				resp := make(chan commit_resp, num_assigned_partitions) // allocating room for the responses helps the code run smoothly
 				for _, con := range consumers {
-					wg.Add(1)
-					con.commit_reqs <- commit_req{resp, &wg}
-				}
-				go func(resp chan commit_resp, wg *sync.WaitGroup) {
-					wg.Wait()
-					close(resp)
-				}(resp, &wg)
-				empty := true
-				for r := range resp {
-					dbgf("ocreq.AddBlock(%q, %d, %d)", r.topic, r.partition, r.offset)
-					ocreq.AddBlock(r.topic, r.partition, r.offset, 0, "")
-					empty = false
-				}
-				if empty {
-					// no point in sending an empty commit message
-					break
-				}
-				dbgf("sending OffsetCommitRequest %v", ocreq)
-				ocresp, err := coor.CommitOffset(ocreq)
-				dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
-				// log any errors we got. there isn't much we can do about them
-				try_sidechannel := false
-				if err != nil {
-					cl.deliverError("committing offsets to "+coor.Addr(), err)
-					reopen = true
-					try_sidechannel = true
-				} else {
-					var prev_kerr sarama.KError // don't print the same error over and over. usually the same error will happen to all partitions
-					for topic, partitions := range ocresp.Errors {
-						for p, kerr := range partitions {
-							if kerr != 0 {
-								if kerr != prev_kerr {
-									cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), kerr)
-									prev_kerr = kerr
-								} else {
-									dbgf("same error committing offset of topic %q partition %d", topic, p, kerr)
-								}
-								switch kerr {
-								case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
-									refresh = true         // the broker is no longer the coordinator. we should refresh the current coordinator
-									try_sidechannel = true // and send the commits to the side-channel (if we have one) in the hope that that might work
-								case sarama.ErrUnknownMemberId:
-									member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
-								case sarama.ErrIllegalGeneration:
-									try_sidechannel = true // a new generation is forming; send our offsets to the sidechannel
-								}
-								err = kerr // any of the kerr's will do
-							}
+					select {
+					case c := <-con.commits_channel:
+						dbgf("received %v on commits channel", c)
+						ocreq := &sarama.OffsetCommitRequest{
+							ConsumerGroup:           cl.group_name,
+							ConsumerGroupGeneration: generation_id,
+							ConsumerID:              member_id,
+							RetentionTime:           int64(clconfig.Consumer.Offsets.Retention / time.Millisecond),
+							Version:                 2, // kafka 0.9.0 version, with RetentionTime
+						}
+						if clconfig.Consumer.Offsets.Retention == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
+							ocreq.RetentionTime = -1 // use broker's value
+						}
+						dbgf("sending OffsetCommitRequest %v", ocreq)
+						ocreq.AddBlock(c.topic, c.partition, c.offset, 0, "")
+
+						dbgf("sending OffsetCommitRequest %v", ocreq)
+						ocresp, err := coor.CommitOffset(ocreq)
+						dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
+						if err != nil {
+							dbgf("Error on Committing offset %v", err)
+							cl.deliverError("committing offsets to "+coor.Addr(), err)
 						}
 					}
 				}
-				if try_sidechannel {
-					// immediately send a commit to the side channel
-					commitToSidechannel()
-				}
-				if err != nil {
-					continue join_loop
-				}
+
+			// case <-commit_timer:
+
+			// 	var wg sync.WaitGroup
+			// 	resp := make(chan commit_resp, num_assigned_partitions) // allocating room for the responses helps the code run smoothly
+			// 	for _, con := range consumers {
+			// 		wg.Add(1)
+			// 		con.commit_reqs <- commit_req{resp, &wg}
+			// 	}
+			// 	go func(resp chan commit_resp, wg *sync.WaitGroup) {
+			// 		wg.Wait()
+			// 		close(resp)
+			// 	}(resp, &wg)
+			// 	empty := true
+			// 	for r := range resp {
+			// 		dbgf("ocreq.AddBlock(%q, %d, %d)", r.topic, r.partition, r.offset)
+			// 		ocreq.AddBlock(r.topic, r.partition, r.offset, 0, "")
+			// 		empty = false
+			// 	}
+			// 	if empty {
+			// 		// no point in sending an empty commit message
+			// 		break
+			// 	}
+			// 	dbgf("sending OffsetCommitRequest %v", ocreq)
+			// 	ocresp, err := coor.CommitOffset(ocreq)
+			// 	dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
+			// 	// log any errors we got. there isn't much we can do about them
+			// 	try_sidechannel := false
+			// 	if err != nil {
+			// 		cl.deliverError("committing offsets to "+coor.Addr(), err)
+			// 		reopen = true
+			// 		try_sidechannel = true
+			// 	} else {
+			// 		var prev_kerr sarama.KError // don't print the same error over and over. usually the same error will happen to all partitions
+			// 		for topic, partitions := range ocresp.Errors {
+			// 			for p, kerr := range partitions {
+			// 				if kerr != 0 {
+			// 					if kerr != prev_kerr {
+			// 						cl.deliverError(fmt.Sprintf("committing offset of topic %q partition %d", topic, p), kerr)
+			// 						prev_kerr = kerr
+			// 					} else {
+			// 						dbgf("same error committing offset of topic %q partition %d", topic, p, kerr)
+			// 					}
+			// 					switch kerr {
+			// 					case sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
+			// 						refresh = true         // the broker is no longer the coordinator. we should refresh the current coordinator
+			// 						try_sidechannel = true // and send the commits to the side-channel (if we have one) in the hope that that might work
+			// 					case sarama.ErrUnknownMemberId:
+			// 						member_id = "" // the coordinator no longer knows who we are; have it assign us a new member id
+			// 					case sarama.ErrIllegalGeneration:
+			// 						try_sidechannel = true // a new generation is forming; send our offsets to the sidechannel
+			// 					}
+			// 					err = kerr // any of the kerr's will do
+			// 				}
+			// 			}
+			// 		}
+			// 	}
+			// 	if try_sidechannel {
+			// 		// immediately send a commit to the side channel
+			// 		commitToSidechannel()
+			// 	}
+			// 	if err != nil {
+			// 		continue join_loop
+			// 	}
 
 			case <-metadata_timer:
 				dbgf("metadata timer")
@@ -1352,6 +1375,8 @@ type consumer struct {
 	assignments chan *assignment // channel over which client.run sends consumer.run each generation's partition assignments
 	commit_reqs chan commit_req  // channel over which client.run sends consumer.run request to fill out a OffsetCommitRequest
 
+	commits_channel chan commit_resp // channel over which to send backup commit requests. AKA what Commit() calls
+
 	restart_partitions chan *partition              // channel through which partition.run delivers partition restart [at new offset] requests
 	premessages        chan *sarama.ConsumerMessage // channel through which partition.run delivers messages to consumer.run
 	done               chan *sarama.ConsumerMessage // channel through which Done() returns messages
@@ -1450,58 +1475,52 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		if clconfig.Consumer.Offsets.Retention == 0 { // note that this and the rounding math above means that if you wanted a retention time of 0 millseconds you could set Config.Offsets.RetentionTime to something < 1 ms, like 1 nanosecond
 			ocreq.RetentionTime = -1 // use broker's value
 		}
-		var sidechannel_offsets = make([]SidechannelOffset, 0, len(removed))
-		for _, p := range removed {
-			// stop consuming from partition p
-			if part, ok := partitions[p]; ok {
-				delete(partitions, p)
-				part.consumer.Close()
-				offset := part.oldest
-				if offset == sarama.OffsetNewest || offset == sarama.OffsetOldest {
-					continue // omit this partition, there is no yet offset we can commit
-				}
-				if len(part.buckets) != 0 {
-					if part.buckets[0][0] == part.buckets[0][1] {
-						// add to that the portion of the last block we know been completed (this is often useful when the traffic rate is low or a client shuts down cleanly, since it has probably cleanly returned all offsets we've delivered)
-						offset += int64(part.buckets[0][1])
-					} // else we don't know enough to commit any further
-				}
-				dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
-				ocreq.AddBlock(con.topic, p, offset, 0, "")
-				sidechannel_offsets = append(sidechannel_offsets, SidechannelOffset{p, offset})
-				logf("consumer %q stopped consuming %q partition %d at offset %d", con.cl.group_name, con.topic, p, offset)
-			}
-		}
-		dbgf("sending OffsetCommitRequest %v", ocreq)
-		ocresp, err := coor.CommitOffset(ocreq)
-		dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
-		// log any errors we got. there isn't much we can do about them; the next consumer will start at an older offset
-		try_sidechannel := false
-		if err != nil {
-			con.deliverError("committing offsets", -1, err)
-			try_sidechannel = true
-		} else {
-			var prev_kerr sarama.KError // don't print the same error over and over. usually the same error will happen to all partitions
-			for _, partitions := range ocresp.Errors {
-				for p, kerr := range partitions {
-					if kerr != 0 {
-						if kerr != prev_kerr {
-							con.deliverError("committing offset", p, kerr)
-							prev_kerr = kerr
-						} else {
-							dbgf("same error committing offset of topic %q partition %d", con.topic, p, kerr)
-						}
-						switch kerr {
-						case sarama.ErrIllegalGeneration, sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
-							try_sidechannel = true
-						}
-					}
-				}
-			}
-		}
-		if try_sidechannel {
-			con.cl.sidechannel_commit <- map[string][]SidechannelOffset{con.topic: sidechannel_offsets}
-		}
+		// var sidechannel_offsets = make([]SidechannelOffset, 0, len(removed))
+		// for _, p := range removed {
+		// 	// stop consuming from partition p
+		// 	if part, ok := partitions[p]; ok {
+		// 		delete(partitions, p)
+		// 		part.consumer.Close()
+		// 		offset := part.oldest
+		// 		if offset == sarama.OffsetNewest || offset == sarama.OffsetOldest {
+		// 			continue // omit this partition, there is no yet offset we can commit
+		// 		}
+		// 		dbgf("ocreq.AddBlock(%q, %d, %d)", con.topic, p, offset)
+		// 		ocreq.AddBlock(con.topic, p, offset, 0, "")
+		// 		sidechannel_offsets = append(sidechannel_offsets, SidechannelOffset{p, offset})
+		// 		logf("consumer %q stopped consuming %q partition %d at offset %d", con.cl.group_name, con.topic, p, offset)
+		// 	}
+		// }
+		// dbgf("sending OffsetCommitRequest %v", ocreq)
+		// ocresp, err := coor.CommitOffset(ocreq)
+		// dbgf("received OffsetCommitResponse %v, %v", ocresp, err)
+		// // log any errors we got. there isn't much we can do about them; the next consumer will start at an older offset
+		// try_sidechannel := false
+		// if err != nil {
+		// 	con.deliverError("committing offsets", -1, err)
+		// 	try_sidechannel = true
+		// } else {
+		// 	var prev_kerr sarama.KError // don't print the same error over and over. usually the same error will happen to all partitions
+		// 	for _, partitions := range ocresp.Errors {
+		// 		for p, kerr := range partitions {
+		// 			if kerr != 0 {
+		// 				if kerr != prev_kerr {
+		// 					con.deliverError("committing offset", p, kerr)
+		// 					prev_kerr = kerr
+		// 				} else {
+		// 					dbgf("same error committing offset of topic %q partition %d", con.topic, p, kerr)
+		// 				}
+		// 				switch kerr {
+		// 				case sarama.ErrIllegalGeneration, sarama.ErrNotCoordinatorForConsumer, sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrRebalanceInProgress:
+		// 					try_sidechannel = true
+		// 				}
+		// 			}
+		// 		}
+		// 	}
+		// }
+		// if try_sidechannel {
+		// 	con.cl.sidechannel_commit <- map[string][]SidechannelOffset{con.topic: sidechannel_offsets}
+		// }
 	}
 
 	// handle a commit request from client.run
@@ -1511,12 +1530,6 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			offset := partition.oldest
 			if offset == sarama.OffsetNewest || offset == sarama.OffsetOldest {
 				continue // omit this partition, there is no offset yet that we can commit (we have not yet received any msgs on this partition)
-			}
-			if len(partition.buckets) != 0 {
-				if partition.buckets[0][0] == partition.buckets[0][1] {
-					// add to that the portion of the last block we know been completed (this is useful when the message rate is slow)
-					offset += int64(partition.buckets[0][1])
-				} // else we don't know enough to commit any further
 			}
 			c.resp <- commit_resp{topic: con.topic, partition: p, offset: offset}
 		}
@@ -1585,23 +1598,6 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 		if delta < 0 {
 			dbgf("stale message %q:%d/%d", msg.Topic, msg.Partition, msg.Offset)
 			return
-		}
-		index := int(delta) >> 6 //  /64
-		if index >= len(part.buckets) {
-			dbgf("early message %d/%d", msg.Partition, msg.Offset)
-			return
-		}
-		part.buckets[index][1]++
-		if index == 0 {
-			// we might have finished the oldest bucket
-			for part.buckets[0] == [2]uint8{64, 64} {
-				// the oldest bucket is complete; advance the last committed offset
-				part.oldest += 64
-				part.buckets = part.buckets[1:]
-				if len(part.buckets) == 0 {
-					break
-				}
-			}
 		}
 	}
 
@@ -1821,12 +1817,6 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 				// we can't take this message into account
 				continue
 			}
-			index := int(delta) >> 6 //  /64
-			for index >= len(part.buckets) {
-				// add a new bucket
-				part.buckets = append(part.buckets, [2]uint8{0, 0})
-			}
-			part.buckets[index][0]++
 
 			// and deliver the msg (or handle any of the other messages which can arrive)
 		deliver_loop:
@@ -1852,6 +1842,7 @@ func (con *consumer) run(wg *sync.WaitGroup) {
 			}
 
 		case msg := <-con.done:
+			fmt.Println("HERE!!!")
 			done(msg)
 		case a := <-con.assignments:
 			assignment(a)
@@ -1877,16 +1868,17 @@ func (con *consumer) Done(msg *sarama.ConsumerMessage) {
 	}
 }
 
+func (con *consumer) Commit(topic string, partition int32, offset int64) {
+
+	con.commits_channel <- commit_resp{topic: topic, partition: partition, offset: offset}
+}
+
 // partition contains the data associated with us consuming one partition
 type partition struct {
 	con       *consumer
 	consumer  sarama.PartitionConsumer
 	partition int32 // partition number
-	// buckets of # of offsets read from kafka, and the # of offsets completed by a call to Done(). the difference is the # of offsets in flight in the calling code
-	// we group offsets in groups of 64 and simply keep a count of how many are outstanding
-	// any time the two counts are equal then the offsets are committable. Otherwise we can't tell which is the not yet Done() offset and so we don't know
-	buckets [][2]uint8
-	oldest  int64 // 1st offset in bucket[0], or OffsetNewest or OffsetOldest if we haven't received any msgs and started at one of those offsets
+	oldest    int64 // 1st offset in bucket[0], or OffsetNewest or OffsetOldest if we haven't received any msgs and started at one of those offsets
 }
 
 // wrap a sarama.ConsumerError into an *Error

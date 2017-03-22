@@ -1,3 +1,11 @@
+## sarama-backup
+
+This is a fork of sarama-consumer that doesn't keep track of buckets and consumed offsets so that backup systems can be built on top of it.
+I think once the API settles down, it can be merged back into github.com/mistsys/sarama-consumer but instead of making the sarama-consumer
+more complicated, working on a fork makes sense for now.
+
+The consumer does away with needing to send a Done every time a message is consumed. Instead opting to let the consumer decide the when to
+commit based on business logic.
 
 ## sarama-consumer --- a kafka consumer group client
 
@@ -9,7 +17,7 @@ creates more garbage for gc to collect)
 
 The assignment of partitions to consumers is pluggable. Two partitioners
 are included: the trivial round-robin, and a stable & consistent partitioner.
-The stable partitioner keeps the assignment of partitions to consumers 
+The stable partitioner keeps the assignment of partitions to consumers
 as stable as it can across time. With it, restarting a consumer within the
 kafka heartbeat timeout (typically 10s of seconds) does not disturb the partition
 assignments of the other consumers, and adding and removing consumers
@@ -26,7 +34,7 @@ key, and the consumers benefit from having messages with the same key
 Simplest usage, a perpetual consumer of a single topic with default
 (round-robin) partitioning:
 
-    import "github.com/mistsys/sarama-consumer"
+    import "github.com/prasincs/sarama-backup"
     import "github.com/Shopify/sarama"
 
     func main() {
@@ -44,4 +52,3 @@ Simplest usage, a perpetual consumer of a single topic with default
         }
       }
     }
-

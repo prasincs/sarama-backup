@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
-	consumer "github.com/mistsys/sarama-consumer"
+	consumer "github.com/prasincs/sarama-backup"
 )
 
 func logf(fmt string, args ...interface{}) {

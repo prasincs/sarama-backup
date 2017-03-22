@@ -13,8 +13,8 @@ import (
 
 	"github.com/Shopify/sarama"
 	"github.com/kr/pretty"
-	consumer "github.com/mistsys/sarama-consumer"
-	"github.com/mistsys/sarama-consumer/stable"
+	consumer "github.com/prasincs/sarama-backup"
+	"github.com/prasincs/sarama-backup/stable"
 )
 
 type assignments map[string]map[string][]int32 // map of member to topic to the assigned list of partitions
